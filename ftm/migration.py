@@ -41,6 +41,7 @@ class MigrationManager:
         if not target.reserve(task.task_id, task.cpu_need, task.memory_need, token):
             return False, "reservation_failed"
 
+        cluster.cancel_recovery(task.task_id)
         task.migration_attempts += 1
         task.migration_target = target_id
         task.status = TaskStatus.MIGRATING
@@ -104,7 +105,8 @@ class MigrationManager:
                     migration.stage = MigrationStage.CONFIRMED
                     emitted.append(Event(now, "migration_confirmed", task_id,
                                          migration.source_id, migration.target_id,
-                                         migration.elapsed_seconds))
+                                         migration.elapsed_seconds,
+                                         duration_seconds=migration.elapsed_seconds))
                     del self.active[task_id]
         cluster.events.extend(emitted)
         return emitted
@@ -130,7 +132,8 @@ class MigrationManager:
             failure_event = None
         self.active.pop(task.task_id, None)
         events = [Event(now, "migration_aborted", task.task_id, migration.source_id,
-                        migration.target_id, reason)]
+                        migration.target_id, reason,
+                        duration_seconds=migration.elapsed_seconds)]
         if failure_event is not None:
             events.append(failure_event)
         return events

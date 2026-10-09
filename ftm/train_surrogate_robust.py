@@ -11,9 +11,12 @@ from pathlib import Path
 
 from .config import SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
+from .ood_scenarios import scenario_family
 from .robust_ppo import PPOConfig
-from .surrogate import estimate_sensitivity_ellipsoid, fit_surrogate, fit_value_model
-from .surrogate_robust_ppo import SurrogatePGDRobustPPO
+from .surrogate import (PARAMETER_NAMES, estimate_sensitivity_ellipsoid,
+                        fit_surrogate, fit_value_model, scenario_to_raw,
+                        training_raw_bounds)
+from .surrogate_robust_ppo import DEFAULT_PGD_SCENARIOS, SurrogatePGDRobustPPO
 
 
 def read_records(path: Path, limit: int | None = None) -> list[dict]:
@@ -36,6 +39,59 @@ def read_records(path: Path, limit: int | None = None) -> list[dict]:
     if len(records) < 2:
         raise ValueError("dataset must contain at least two valid transitions")
     return records
+
+
+def build_scenario_pgd_constraints(records: list[dict], surrogate, value_model,
+                                   action_dim: int, config: SimulationConfig,
+                                   scenario_names: tuple[str, ...], alpha: float,
+                                   device: str) -> dict[str, dict]:
+    dimensions = {len(record["parameters"]) for record in records}
+    if len(dimensions) != 1:
+        raise ValueError("training records must use one consistent parameter dimension")
+    parameter_dim = dimensions.pop()
+    if parameter_dim not in (6, len(PARAMETER_NAMES)):
+        raise ValueError("training records must have six legacy or current parameters")
+
+    constraints_by_family = {}
+    required_families = {scenario_family(name) for name in scenario_names}
+    for family in sorted(required_families):
+        family_records = []
+        for record in records:
+            name = record.get("scenario")
+            if not isinstance(name, str):
+                continue
+            try:
+                record_family = scenario_family(name)
+            except ValueError:
+                continue
+            if record_family == family:
+                family_records.append(record)
+        if len(family_records) < 2:
+            raise ValueError(
+                f"need at least two transition records for PGD family {family!r}"
+            )
+
+        template = scenario_by_name(family, config)
+        center = scenario_to_raw(template)[:parameter_dim]
+        _, axes, _, gradient = estimate_sensitivity_ellipsoid(
+            family_records, surrogate, value_model, action_dim,
+            alpha=alpha, device=device, max_records=512,
+            center_override=center,
+        )
+        lower, upper = training_raw_bounds(template, parameter_dim=parameter_dim)
+        constraints_by_family[family] = {
+            "center": center,
+            "axes": axes,
+            "alpha": alpha,
+            "lower_bounds": lower,
+            "upper_bounds": upper,
+            "sensitivity_gradient": gradient,
+            "parameter_names": PARAMETER_NAMES[:parameter_dim],
+        }
+    return {
+        name: constraints_by_family[scenario_family(name)]
+        for name in scenario_names
+    }
 
 
 def main() -> None:
@@ -76,9 +132,14 @@ def main() -> None:
     center, axes, _, gradient = estimate_sensitivity_ellipsoid(
         records, surrogate, value_model, action_dim, alpha=args.alpha, device=device
     )
+    scenario_constraints = build_scenario_pgd_constraints(
+        records, surrogate, value_model, action_dim, config,
+        DEFAULT_PGD_SCENARIOS, args.alpha, device,
+    )
     trainer = SurrogatePGDRobustPPO(
         surrogate, center, axes, args.alpha, env_config=config, ppo_config=PPOConfig(),
         device=device, seed=args.seed, pgd_steps=args.pgd_steps,
+        scenario_constraints=scenario_constraints,
     )
     results = trainer.train(args.episodes)
 
@@ -90,6 +151,8 @@ def main() -> None:
         "action_dim": action_dim,
         "pgd_steps": args.pgd_steps,
         "center": center, "axes": axes, "alpha": args.alpha,
+        "parameter_names": PARAMETER_NAMES[:len(center)],
+        "scenario_pgd_constraints": scenario_constraints,
         "sensitivity_gradient": gradient,
         "env_config": asdict(config), "ppo_config": asdict(trainer.ppo_config),
         "seed": args.seed, "episodes": args.episodes,

@@ -42,6 +42,7 @@ class Node:
     external_cpu_fraction: float = 0.0
     external_memory: float = 0.0
     reservations: dict[str, Reservation] = field(default_factory=dict)
+    normal_external_cpu_fraction: float = 0.105
 
     @property
     def cpu_used(self) -> float:
@@ -59,7 +60,12 @@ class Node:
     def memory_utilization(self) -> float:
         return min(1.0, self.memory_used / self.memory_capacity)
 
+    @property
+    def estimated_burst_cpu_fraction(self) -> float:
+        return max(0.0, self.external_cpu_fraction - self.normal_external_cpu_fraction)
+
     def can_host(self, cpu: float, memory: float) -> bool:
+        # CPU reservations are the hard limit; external CPU load remains a soft load.
         return (self.up and self.cpu_used + cpu <= self.cpu_capacity + 1e-9
                 and self.memory_used + memory <= self.memory_capacity + 1e-9)
 
@@ -141,6 +147,12 @@ class Task:
     def restore_latest_checkpoint(self) -> None:
         self.remaining_work = max(0.0, self.total_work - self.checkpoint_work)
 
+    def has_missed_deadline(self, now: float) -> bool:
+        """Return whether this task finished late or remains unfinished past its deadline."""
+        if self.completion_time is not None:
+            return self.completion_time > self.deadline_seconds
+        return now > self.deadline_seconds
+
 
 @dataclass
 class Migration:
@@ -163,3 +175,4 @@ class Event:
     node_id: int | None = None
     target_id: int | None = None
     value: float | str | None = None
+    duration_seconds: float | None = None

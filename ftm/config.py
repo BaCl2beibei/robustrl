@@ -16,7 +16,18 @@ class ScenarioConfig:
     common_shock_congestion_boost: float = 0.35
     load_burst_probability: float = 0.02
     load_burst_cpu: float = 0.35
-    load_burst_duration_steps: int = 5
+    load_burst_duration_steps: int | None = None
+    disconnect_enter: float = 0.0
+    disconnect_leave: float = 0.3
+    common_shock_disconnect_boost: float = 0.0
+    load_burst_duration_min_seconds: float = 5.0
+    load_burst_duration_max_seconds: float = 60.0
+
+    def load_burst_duration_bounds(self, dt_seconds: float = 1.0) -> tuple[float, float]:
+        if self.load_burst_duration_steps is not None:
+            duration = float(self.load_burst_duration_steps) * dt_seconds
+            return duration, duration
+        return self.load_burst_duration_min_seconds, self.load_burst_duration_max_seconds
 
     @property
     def bgmm_normal_weight(self) -> float:
@@ -28,12 +39,17 @@ class ScenarioConfig:
         if self.failure_multiplier < 0:
             raise ValueError("failure_multiplier must be non-negative")
         for name in ("congestion_enter", "congestion_leave", "common_shock_probability",
-                     "load_burst_probability", "load_burst_cpu"):
+                     "load_burst_probability", "load_burst_cpu", "disconnect_enter",
+                     "disconnect_leave", "common_shock_disconnect_boost"):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
-        if self.load_burst_duration_steps < 1:
+        if (self.load_burst_duration_steps is not None
+                and self.load_burst_duration_steps < 1):
             raise ValueError("load_burst_duration_steps must be positive")
+        if (self.load_burst_duration_min_seconds <= 0
+                or self.load_burst_duration_max_seconds < self.load_burst_duration_min_seconds):
+            raise ValueError("invalid load burst duration range")
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,7 @@ class SimulationConfig:
     task_memory_min: float = 2.0
     task_memory_max: float = 12.0
     task_deadline_multiplier: float = 1.8
+    delay_cost_weight: float = 0.5
 
     def __post_init__(self) -> None:
         if self.n_nodes < 2:
@@ -86,3 +103,5 @@ class SimulationConfig:
             raise ValueError("link bandwidth must be positive")
         if self.task_work_min <= 0 or self.task_work_max < self.task_work_min:
             raise ValueError("invalid task work interval")
+        if self.delay_cost_weight < 0:
+            raise ValueError("delay_cost_weight must be non-negative")

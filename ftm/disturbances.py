@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .config import ScenarioConfig, SimulationConfig
 from .entities import Node
+from .policies import predict_burst_remaining
 from .reliability import sample_node_state
 
 
@@ -26,7 +27,25 @@ class DisturbanceModel:
         self.scenario = scenario
         self.rng = rng
         self.network_congested = [[False] * config.n_nodes for _ in range(config.n_nodes)]
-        self.burst_remaining = [0] * config.n_nodes
+        self.network_disconnected = [[False] * config.n_nodes for _ in range(config.n_nodes)]
+        self.burst_remaining = [0.0] * config.n_nodes
+        self.burst_elapsed_seconds = [0.0] * config.n_nodes
+        self.burst_total_seconds = [0.0] * config.n_nodes
+        self.burst_history_seconds: list[list[float]] = [
+            [] for _ in range(config.n_nodes)
+        ]
+
+    def predict_burst_remaining_seconds(self, node_id: int) -> float:
+        if self.burst_remaining[node_id] <= 0.0:
+            return 0.0
+        duration_min, duration_max = self.scenario.load_burst_duration_bounds(
+            self.config.dt_seconds
+        )
+        default_duration = (duration_min + duration_max) / 2.0
+        return predict_burst_remaining(
+            self.burst_elapsed_seconds[node_id], self.burst_history_seconds[node_id],
+            default_duration,
+        )
 
     def sample(self, nodes: list[Node], dt_seconds: float) -> DisturbanceSample:
         common = self.rng.random() < self.scenario.common_shock_probability
@@ -34,6 +53,7 @@ class DisturbanceModel:
         if common:
             rate_multiplier *= self.scenario.common_shock_failure_multiplier
         events: list[tuple[int, str]] = []
+        any_burst_active = False
         for node in nodes:
             was_up = node.up
             node.up, event = sample_node_state(
@@ -42,33 +62,75 @@ class DisturbanceModel:
             )
             if event:
                 events.append((node.node_id, event))
-            if self.burst_remaining[node.node_id] > 0:
-                self.burst_remaining[node.node_id] -= 1
-            elif self.rng.random() < self.scenario.load_burst_probability:
-                self.burst_remaining[node.node_id] = self.scenario.load_burst_duration_steps
-            burst = self.burst_remaining[node.node_id] > 0
             baseline = 0.08 + 0.05 * self.rng.random()
+            node_id = node.node_id
+            if (self.burst_remaining[node_id] <= 0.0
+                    and self.rng.random() < self.scenario.load_burst_probability):
+                duration_min, duration_max = self.scenario.load_burst_duration_bounds(
+                    self.config.dt_seconds
+                )
+                duration = self.rng.uniform(duration_min, duration_max)
+                self.burst_remaining[node_id] = duration
+                self.burst_total_seconds[node_id] = duration
+                self.burst_elapsed_seconds[node_id] = 0.0
+
+            active_burst_seconds = min(dt_seconds, self.burst_remaining[node_id])
+            burst_fraction = active_burst_seconds / dt_seconds
+            burst = active_burst_seconds > 0.0
+            any_burst_active = any_burst_active or burst
             node.external_cpu_fraction = min(
-                0.95, baseline + (self.scenario.load_burst_cpu if burst else 0.0)
+                0.95, baseline + self.scenario.load_burst_cpu * burst_fraction
             )
             node.external_memory = node.memory_capacity * (0.04 + 0.04 * self.rng.random())
+            if burst:
+                self.burst_elapsed_seconds[node_id] += active_burst_seconds
+                self.burst_remaining[node_id] = max(
+                    0.0, self.burst_remaining[node_id] - dt_seconds
+                )
+                if self.burst_remaining[node_id] <= 1e-9:
+                    self.burst_history_seconds[node_id].append(
+                        self.burst_total_seconds[node_id]
+                    )
+                    self.burst_total_seconds[node_id] = 0.0
+                    self.burst_elapsed_seconds[node_id] = 0.0
+            else:
+                node.normal_external_cpu_fraction = (
+                    0.9 * node.normal_external_cpu_fraction + 0.1 * baseline
+                )
         self._advance_network_regimes(common)
-        return DisturbanceSample(common, tuple(events), any(self.burst_remaining))
+        return DisturbanceSample(common, tuple(events), any_burst_active)
 
     def _advance_network_regimes(self, common_shock: bool) -> None:
         n = self.config.n_nodes
         p_enter = self.scenario.congestion_enter
+        p_disconnect = self.scenario.disconnect_enter
         if common_shock:
             p_enter = min(1.0, p_enter + self.scenario.common_shock_congestion_boost)
+            p_disconnect = min(
+                1.0, p_disconnect + self.scenario.common_shock_disconnect_boost
+            )
         for i in range(n):
-            for j in range(n):
-                if i == j:
-                    self.network_congested[i][j] = False
-                elif self.network_congested[i][j]:
+            self.network_congested[i][i] = False
+            self.network_disconnected[i][i] = False
+            for j in range(i + 1, n):
+                disconnected = self.network_disconnected[i][j]
+                congested = self.network_congested[i][j]
+                if disconnected:
+                    if self.rng.random() < self.scenario.disconnect_leave:
+                        disconnected = False
+                        congested = self.rng.random() < p_enter
+                elif self.rng.random() < p_disconnect:
+                    disconnected = True
+                    congested = False
+                elif congested:
                     if self.rng.random() < self.scenario.congestion_leave:
-                        self.network_congested[i][j] = False
+                        congested = False
                 elif self.rng.random() < p_enter:
-                    self.network_congested[i][j] = True
+                    congested = True
+                self.network_disconnected[i][j] = disconnected
+                self.network_disconnected[j][i] = disconnected
+                self.network_congested[i][j] = congested
+                self.network_congested[j][i] = congested
 
     def link_delay_seconds(self, congested: bool) -> float:
         if congested:

@@ -85,7 +85,8 @@ class FiniteScenarioRobustPPO:
     def __init__(self, env_config: SimulationConfig | None = None,
                  ppo_config: PPOConfig | None = None,
                  scenario_names: tuple[str, ...] =
-                 ("normal", "failure", "network", "load", "mixed"),
+                 ("normal", "failure", "network", "load_short", "load_medium",
+                  "load_sustained", "mixed"),
                  device: str | None = None, seed: int = 2026) -> None:
         if not scenario_names:
             raise ValueError("scenario_names must not be empty")
@@ -260,4 +261,3 @@ class FiniteScenarioRobustPPO:
             "episodes": episodes,
             "scenario_returns": self.scenario_returns,
         }, path)
-

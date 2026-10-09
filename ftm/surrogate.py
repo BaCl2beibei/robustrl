@@ -21,7 +21,7 @@ from .uncertainty import sensitivity_axes, sigmoid, softplus
 
 PARAMETER_NAMES = ("failure_multiplier", "congestion_enter", "congestion_leave",
                    "common_shock_probability", "load_burst_probability",
-                   "load_burst_cpu")
+                   "load_burst_cpu", "disconnect_enter", "disconnect_leave")
 
 
 def _inverse_softplus(value: float) -> float:
@@ -35,7 +35,7 @@ def _logit(probability: float) -> float:
 
 
 def scenario_to_raw(scenario: ScenarioConfig) -> tuple[float, ...]:
-    """Encode the six simulator controls in unconstrained coordinates."""
+    """Encode the adversarially controlled simulator parameters."""
     return (
         _inverse_softplus(scenario.failure_multiplier),
         _logit(scenario.congestion_enter),
@@ -43,16 +43,17 @@ def scenario_to_raw(scenario: ScenarioConfig) -> tuple[float, ...]:
         _logit(scenario.common_shock_probability),
         _logit(scenario.load_burst_probability),
         _logit(scenario.load_burst_cpu),
+        _logit(scenario.disconnect_enter),
+        _logit(scenario.disconnect_leave),
     )
 
 
 def raw_to_scenario(raw: Sequence[float], template: ScenarioConfig,
                     name: str = "pgd_adversarial") -> ScenarioConfig:
-    if len(raw) != len(PARAMETER_NAMES):
-        raise ValueError(f"raw parameter vector must have {len(PARAMETER_NAMES)} entries")
+    if len(raw) not in (6, len(PARAMETER_NAMES)):
+        raise ValueError("raw parameter vector must have six legacy or current entries")
     values = [float(x) for x in raw]
-    return replace(
-        template,
+    changes = dict(
         name=name,
         failure_multiplier=softplus(values[0]) + 1e-8,
         congestion_enter=sigmoid(values[1]),
@@ -61,6 +62,10 @@ def raw_to_scenario(raw: Sequence[float], template: ScenarioConfig,
         load_burst_probability=sigmoid(values[4]),
         load_burst_cpu=sigmoid(values[5]),
     )
+    if len(values) == len(PARAMETER_NAMES):
+        changes.update(disconnect_enter=sigmoid(values[6]),
+                       disconnect_leave=sigmoid(values[7]))
+    return replace(template, **changes)
 
 
 def perturb_scenario(template: ScenarioConfig, rng: random.Random,
@@ -72,6 +77,22 @@ def perturb_scenario(template: ScenarioConfig, rng: random.Random,
     return raw_to_scenario(perturbed, template, name=template.name + "_sample")
 
 
+def training_raw_bounds(template: ScenarioConfig, noise_std: float = 0.25,
+                        parameter_dim: int | None = None
+                        ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return the per-scenario raw-parameter region within two noise stddevs."""
+    if noise_std < 0:
+        raise ValueError("noise_std must be non-negative")
+    center = scenario_to_raw(template)
+    if parameter_dim is not None:
+        if not 1 <= parameter_dim <= len(center):
+            raise ValueError("parameter_dim is outside the supported parameter range")
+        center = center[:parameter_dim]
+    radius = 2.0 * noise_std
+    return (tuple(value - radius for value in center),
+            tuple(value + radius for value in center))
+
+
 def _torch():
     try:
         import torch
@@ -81,7 +102,7 @@ def _torch():
 
 
 def build_transition_surrogate(state_dim: int, action_dim: int,
-                                parameter_dim: int = 6):
+                                parameter_dim: int = len(PARAMETER_NAMES)):
     torch = _torch()
     nn = torch.nn
     input_dim = state_dim + action_dim + parameter_dim
@@ -126,6 +147,73 @@ def build_value_model(state_dim: int):
     return ValueModel()
 
 
+def _infer_state_layout(state_dim: int, action_dim: int) -> tuple[int, int]:
+    """Infer node and task counts from the current MigrationEnvironment layout."""
+    n_nodes = action_dim - 1
+    if n_nodes < 2:
+        raise ValueError("action_dim must include at least two nodes and the wait action")
+    # Node features (8 each), directed links (4 each), task state (16 + 2N),
+    # global features (3), burst estimates (N), and migration progress (3/task).
+    fixed = 4 * n_nodes * n_nodes + 9 * n_nodes + 3
+    task_stride = 19 + 2 * n_nodes
+    remaining = state_dim - fixed
+    if remaining < task_stride or remaining % task_stride:
+        raise ValueError("state dimension does not match MigrationEnvironment layout")
+    return n_nodes, remaining // task_stride
+
+
+def project_predicted_next_state(predicted_state, action_dim: int):
+    """Project a surrogate state onto the simulator's feature constraints.
+
+    Continuous features are clipped to their [0, 1] observation range with a
+    straight-through gradient. Binary features use a hard threshold with an
+    identity backward pass. One-hot groups use hard argmax in the forward pass
+    and softmax gradients in the backward pass, so the critic sees legal states
+    while PGD retains a gradient path.
+    """
+    torch = _torch()
+    n_nodes, n_tasks = _infer_state_layout(predicted_state.shape[-1], action_dim)
+    clipped = predicted_state.clamp(0.0, 1.0)
+    projected = predicted_state + (clipped - predicted_state).detach()
+    projected = projected.clone()
+
+    binary_indices = [node * 8 for node in range(n_nodes)]
+    link_offset = 8 * n_nodes
+    binary_indices.extend(
+        link_offset + link * 4 + field
+        for link in range(n_nodes * n_nodes) for field in (2, 3)
+    )
+    task_offset = link_offset + 4 * n_nodes * n_nodes
+    task_stride = 16 + 2 * n_nodes
+    categorical_groups = []
+    for task in range(n_tasks):
+        offset = task_offset + task * task_stride
+        binary_indices.append(offset + 6)  # SLA flag
+        categorical_groups.extend((
+            (offset + 8, 6),                    # task status
+            (offset + 14, n_nodes + 1),         # task node, including None
+            (offset + 15 + n_nodes, n_nodes + 1),  # migration target, including None
+        ))
+    global_offset = task_offset + n_tasks * task_stride
+    binary_indices.append(global_offset + 2)  # common-shock flag
+
+    for index in binary_indices:
+        value = predicted_state[..., index]
+        hard = (value >= 0.5).to(dtype=value.dtype)
+        projected[..., index] = value + (hard - value).detach()
+
+    for start, width in categorical_groups:
+        logits = predicted_state[..., start:start + width]
+        probabilities = torch.softmax(logits, dim=-1)
+        hard = torch.nn.functional.one_hot(
+            probabilities.argmax(dim=-1), num_classes=width
+        ).to(dtype=probabilities.dtype)
+        projected[..., start:start + width] = (
+            hard - probabilities.detach() + probabilities
+        )
+    return projected
+
+
 def _records_to_tensors(records: Sequence[Mapping], action_dim: int, device: str):
     torch = _torch()
     if not records:
@@ -153,7 +241,8 @@ def fit_surrogate(records: Sequence[Mapping], action_dim: int,
     states, one_hot, parameters, next_states, rewards, _, terminals = _records_to_tensors(
         records, action_dim, device
     )
-    model = build_transition_surrogate(states.shape[-1], action_dim).to(device)
+    model = build_transition_surrogate(states.shape[-1], action_dim,
+                                       parameter_dim=parameters.shape[-1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     count = states.shape[0]
     for _ in range(epochs):
@@ -203,7 +292,9 @@ def estimate_sensitivity_ellipsoid(records: Sequence[Mapping], surrogate,
                                    alpha: float = 1.0, min_scale: float = 0.02,
                                    min_axis_fraction: float = 0.05,
                                    max_records: int = 2048,
-                                   device: str = "cpu") -> tuple[tuple[float, ...],
+                                   device: str = "cpu",
+                                   center_override: Sequence[float] | None = None
+                                   ) -> tuple[tuple[float, ...],
                                                                   tuple[float, ...], float,
                                                                   tuple[float, ...]]:
     """Estimate center, axes and mean |d Bellman target / d raw parameter|.
@@ -230,13 +321,19 @@ def estimate_sensitivity_ellipsoid(records: Sequence[Mapping], surrogate,
         delta, reward, terminal_logits = surrogate(
             states[index:index + 1], one_hot[index:index + 1], raw.unsqueeze(0)
         )
-        predicted_next = (states[index:index + 1] + delta).clamp(0.0, 1.0)
+        predicted_next = project_predicted_next_state(
+            states[index:index + 1] + delta, action_dim
+        )
         continuation = 1.0 - torch.sigmoid(terminal_logits).mean()
         target = reward.mean() + gamma * continuation * value_model(predicted_next).mean()
         grad, = torch.autograd.grad(target, raw)
         abs_gradients.append(grad.detach().abs())
     gradient = torch.stack(abs_gradients).mean(dim=0)
     center = tuple(float(v) for v in center_tensor.detach().cpu().tolist())
+    if center_override is not None:
+        if len(center_override) != parameters.shape[-1]:
+            raise ValueError("center_override dimension does not match training parameters")
+        center = tuple(float(value) for value in center_override)
     base_scales = tuple(float(v) for v in scales_tensor.detach().cpu().tolist())
     grad_values = tuple(float(v) for v in gradient.detach().cpu().tolist())
     axes = sensitivity_axes(grad_values, base_scales, min_axis_fraction)
@@ -247,7 +344,9 @@ def worst_case_scenario(model, critic_value: Callable, state: Sequence[float],
                         action: int, center: Sequence[float], axes: Sequence[float],
                         alpha: float, template: ScenarioConfig, gamma: float = 0.99,
                         pgd_steps: int = 8, learning_rate: float = 0.05,
-                        device: str = "cpu"):
+                        device: str = "cpu",
+                        lower_bounds: Sequence[float] | None = None,
+                        upper_bounds: Sequence[float] | None = None):
     """PGD on the learned one-step Bellman surrogate; return physical parameters."""
     torch = _torch()
     from .torch_ops import projected_adversarial_search
@@ -262,7 +361,8 @@ def worst_case_scenario(model, critic_value: Callable, state: Sequence[float],
 
     def objective(raw):
         delta, reward, terminal_logits = model(state_tensor, action_tensor, raw.unsqueeze(0))
-        predicted_next = (state_tensor + delta).clamp(0.0, 1.0)
+        predicted_next = project_predicted_next_state(state_tensor + delta,
+                                                       model.action_dim)
         next_value = critic_value(predicted_next)
         continuation = 1.0 - torch.sigmoid(terminal_logits).mean()
         return reward.mean() + gamma * continuation * next_value.mean()
@@ -270,6 +370,7 @@ def worst_case_scenario(model, critic_value: Callable, state: Sequence[float],
     raw_worst, value = projected_adversarial_search(
         center_tensor, axes_tensor, alpha, objective, steps=pgd_steps,
         learning_rate=learning_rate,
+        lower_bounds=lower_bounds, upper_bounds=upper_bounds,
     )
     scenario = raw_to_scenario(raw_worst.detach().cpu().tolist(), template)
     return scenario, tuple(float(v) for v in raw_worst.detach().cpu().tolist()), float(value.item())

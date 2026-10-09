@@ -29,8 +29,10 @@ class Network:
                 if i == j:
                     link.delay_seconds = 0.0
                     link.congested = False
+                    link.reachable = True
                     continue
                 link.congested = disturbance.network_congested[i][j]
+                link.reachable = not disturbance.network_disconnected[i][j]
                 link.delay_seconds = disturbance.link_delay_seconds(link.congested)
 
     def transfer_rate(self, source: int | None, target: int) -> float:

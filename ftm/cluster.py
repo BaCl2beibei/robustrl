@@ -23,7 +23,13 @@ class Cluster:
         self.time_seconds = 0.0
         self.available_node_seconds = 0.0
         self.cpu_used_seconds = 0.0
+        self.task_cpu_used_seconds = 0.0
+        self.task_cpu_reserved_seconds = 0.0
+        self.external_cpu_used_seconds = 0.0
         self.memory_used_seconds = 0.0
+        self.task_demand_seconds = 0.0
+        self.task_served_seconds = 0.0
+        self.recovery_remaining: dict[int, float] = {}
 
     def place(self, task: Task, node_id: int) -> bool:
         node = self.nodes[node_id]
@@ -50,46 +56,109 @@ class Cluster:
                 now: float) -> list[Event]:
         self.time_seconds = now
         emitted: list[Event] = []
+        recovery_started: set[int] = set()
         for node_id, kind in disturbance.failed_or_repaired:
             emitted.append(Event(now, kind, node_id=node_id))
             if kind == "node_failure":
                 for task in self.tasks.values():
-                    if task.node_id == node_id and task.status == TaskStatus.RUNNING:
+                    if task.node_id != node_id:
+                        continue
+                    self.recovery_remaining.pop(task.task_id, None)
+                    if task.status == TaskStatus.RUNNING:
                         task.restore_latest_checkpoint()
                         task.status = TaskStatus.INTERRUPTED
                         emitted.append(Event(now, "task_interrupted", task.task_id, node_id,
                                              value=task.checkpoint_version))
+            elif kind == "node_repair":
+                node = self.nodes[node_id]
+                for task in self.tasks.values():
+                    reservation = node.reservations.get(task_token(task.task_id))
+                    if (task.node_id == node_id and task.status == TaskStatus.INTERRUPTED
+                            and reservation is not None
+                            and reservation.task_id == task.task_id):
+                        self.recovery_remaining[task.task_id] = (
+                            self.config.restore_delay_seconds
+                        )
+                        recovery_started.add(task.task_id)
+                        emitted.append(Event(now, "task_recovery_started", task.task_id,
+                                             node_id,
+                                             value=self.config.restore_delay_seconds))
 
         up_count = sum(1 for node in self.nodes.values() if node.up)
         if up_count >= self.config.k_required:
             self.available_node_seconds += dt_seconds
+        up_nodes = [node for node in self.nodes.values() if node.up]
         self.cpu_used_seconds += dt_seconds * sum(
             min(node.cpu_capacity, node.cpu_used + node.external_cpu_fraction * node.cpu_capacity)
-            for node in self.nodes.values() if node.up
+            for node in up_nodes
+        )
+        self.task_cpu_reserved_seconds += dt_seconds * sum(node.cpu_used for node in up_nodes)
+        self.external_cpu_used_seconds += dt_seconds * sum(
+            node.external_cpu_fraction * node.cpu_capacity for node in up_nodes
         )
         self.memory_used_seconds += dt_seconds * sum(
             min(node.memory_capacity, node.memory_used)
-            for node in self.nodes.values() if node.up
+            for node in up_nodes
         )
+        active_tasks = [task for task in self.tasks.values()
+                        if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)]
+        running_tasks = [task for task in active_tasks
+                         if task.status == TaskStatus.RUNNING and task.node_id is not None
+                         and self.nodes[task.node_id].up]
+        self.task_demand_seconds += dt_seconds * len(active_tasks)
+        self.task_served_seconds += dt_seconds * len(running_tasks)
 
         for task in self.tasks.values():
-            if task.status != TaskStatus.RUNNING or task.node_id is None:
-                continue
-            node = self.nodes[task.node_id]
-            if not node.up:
-                continue
-            effective_rate = node.cpu_rate * task.cpu_need * max(
-                0.05, 1.0 - node.external_cpu_fraction
-            )
-            completed = task.advance(effective_rate * dt_seconds, now)
-            if not task.sla_violated and now >= task.deadline_seconds:
+            if task.status == TaskStatus.RUNNING and task.node_id is not None:
+                node = self.nodes[task.node_id]
+                if node.up:
+                    effective_rate = node.cpu_rate * task.cpu_need * max(
+                        0.05, 1.0 - node.external_cpu_fraction
+                    )
+                    work_before = task.remaining_work
+                    completed = task.advance(effective_rate * dt_seconds, now)
+                    work_done = work_before - task.remaining_work
+                    self.task_cpu_used_seconds += (
+                        task.cpu_need * work_done / effective_rate
+                    )
+                    if completed:
+                        node.release(task_token(task.task_id))
+                        emitted.append(Event(now, "task_completed", task.task_id, node.node_id))
+
+            if not task.sla_violated and task.has_missed_deadline(now):
                 task.sla_violated = True
-                emitted.append(Event(now, "sla_violated", task.task_id, node.node_id))
-            if completed:
-                node.release(task_token(task.task_id))
-                emitted.append(Event(now, "task_completed", task.task_id, node.node_id))
+                emitted.append(Event(now, "sla_violated", task.task_id, task.node_id))
+
+        self._advance_recoveries(dt_seconds, now, recovery_started, emitted)
         self.events.extend(emitted)
         return emitted
+
+    def cancel_recovery(self, task_id: int) -> None:
+        self.recovery_remaining.pop(task_id, None)
+
+    def _advance_recoveries(self, dt_seconds: float, now: float,
+                            started_this_step: set[int], emitted: list[Event]) -> None:
+        for task_id, remaining in list(self.recovery_remaining.items()):
+            task = self.tasks[task_id]
+            if task.status != TaskStatus.INTERRUPTED or task.node_id is None:
+                self.recovery_remaining.pop(task_id, None)
+                continue
+            node = self.nodes[task.node_id]
+            reservation = node.reservations.get(task_token(task_id))
+            if not node.up or reservation is None or reservation.task_id != task_id:
+                self.recovery_remaining.pop(task_id, None)
+                continue
+            if (node.cpu_used > node.cpu_capacity + 1e-9
+                    or node.memory_used > node.memory_capacity + 1e-9):
+                continue
+            if task_id not in started_this_step:
+                remaining = max(0.0, remaining - dt_seconds)
+            if remaining <= 0.0:
+                task.status = TaskStatus.RUNNING
+                self.recovery_remaining.pop(task_id, None)
+                emitted.append(Event(now, "task_recovered", task_id, node.node_id))
+            else:
+                self.recovery_remaining[task_id] = remaining
 
     def release_task(self, task: Task) -> None:
         if task.node_id is not None:
@@ -113,10 +182,11 @@ class Cluster:
         n = len(self.nodes)
         for node in self.nodes.values():
             values.extend((float(node.up), node.cpu_utilization, node.memory_utilization,
-                           node.external_cpu_fraction,
+                           node.estimated_burst_cpu_fraction,
                            sum(1 for t in self.tasks.values()
                                if t.node_id == node.node_id and t.status in
-                               (TaskStatus.RUNNING, TaskStatus.MIGRATING)),
+                               (TaskStatus.RUNNING, TaskStatus.MIGRATING))
+                           / max(1, len(self.tasks)),
                            min(1.0, node.failure_rate * 1000.0),
                            min(1.0, node.repair_rate * 100.0),
                            min(1.0, len(node.reservations) / max(1, len(self.tasks)))))
@@ -129,11 +199,12 @@ class Cluster:
         status_order = (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.MIGRATING,
                         TaskStatus.INTERRUPTED, TaskStatus.COMPLETED, TaskStatus.FAILED)
         for task in self.tasks.values():
-            values.extend((task.cpu_need / self.config.cpu_capacity,
-                           task.memory_need / self.config.memory_capacity,
+            values.extend((min(1.0, task.cpu_need / self.config.cpu_capacity),
+                           min(1.0, task.memory_need / self.config.memory_capacity),
                            task.remaining_work / task.total_work,
                            task.checkpoint_work / task.total_work,
-                           max(0.0, task.deadline_seconds - self.time_seconds) / time_limit,
+                           min(1.0, max(0.0, task.deadline_seconds - self.time_seconds)
+                               / time_limit),
                            max(0.0, self.time_seconds - task.last_checkpoint_time) / time_limit,
                            float(task.sla_violated),
                            min(1.0, task.migration_attempts / self.config.max_migration_attempts)))

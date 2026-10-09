@@ -24,10 +24,19 @@ def scenario_by_name(name: str, config: SimulationConfig) -> ScenarioConfig:
                               load_burst_probability=0.01)
     if name == "network":
         return ScenarioConfig(name, failure_multiplier=0.5, congestion_enter=0.35,
-                              congestion_leave=0.12, load_burst_probability=0.005)
-    if name == "load":
+                              congestion_leave=0.12, load_burst_probability=0.005,
+                              disconnect_enter=0.08, disconnect_leave=0.30)
+    if name in ("load", "load_short", "load_medium", "load_sustained"):
+        duration_range = {
+            "load": (5.0, 60.0),
+            "load_short": (2.0, 5.0),
+            "load_medium": (10.0, 30.0),
+            "load_sustained": (30.0, 120.0),
+        }[name]
         return ScenarioConfig(name, failure_multiplier=0.5, congestion_enter=0.08,
-                              load_burst_probability=0.15, load_burst_cpu=0.55)
+                              load_burst_probability=0.15, load_burst_cpu=0.55,
+                              load_burst_duration_min_seconds=duration_range[0],
+                              load_burst_duration_max_seconds=duration_range[1])
     if name == "mixed":
         return ScenarioConfig(name, failure_multiplier=3.0, congestion_enter=0.16,
                               congestion_leave=0.22, common_shock_probability=0.001,
@@ -117,8 +126,10 @@ class MigrationEnvironment:
         values = list(self.cluster.state_vector(self.last_common_shock,
                                                 self.config.max_time_seconds))
         for node_id in range(self.config.n_nodes):
-            values.append(min(1.0, self.disturbances.burst_remaining[node_id]
-                              / self.scenario.load_burst_duration_steps))
+            values.append(min(
+                1.0, self.disturbances.predict_burst_remaining_seconds(node_id)
+                / self.config.max_time_seconds
+            ))
         for task_id, task in self.cluster.tasks.items():
             migration = self.manager.active.get(task_id)
             if migration is None:
@@ -159,27 +170,39 @@ class MigrationEnvironment:
         for _ in range(self.config.decision_period_steps):
             if self.time_seconds >= self.config.max_time_seconds:
                 break
+            dt_seconds = min(self.config.dt_seconds,
+                             self.config.max_time_seconds - self.time_seconds)
+            unfinished_before = sum(
+                task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                for task in self.cluster.tasks.values()
+            )
             sample = self.disturbances.sample(list(self.cluster.nodes.values()),
-                                              self.config.dt_seconds)
+                                              dt_seconds)
             self.last_common_shock = sample.common_shock
             self.cluster.network.update(self.disturbances)
-            self.time_seconds += self.config.dt_seconds
-            tick_events = self.cluster.advance(self.config.dt_seconds, sample,
+            self.time_seconds += dt_seconds
+            tick_events = self.cluster.advance(dt_seconds, sample,
                                                self.time_seconds)
-            migration_events = self.manager.advance(self.config.dt_seconds,
+            migration_events = self.manager.advance(dt_seconds,
                                                      self.cluster, self.time_seconds)
             schedule_events = self._schedule_pending()
             for event in tick_events + migration_events + schedule_events:
                 reward += self._event_reward(event)
-            reward -= self._resource_overload_cost() * self.config.dt_seconds
+            reward -= self._resource_overload_cost() * dt_seconds
+            reward -= (self.config.delay_cost_weight * dt_seconds
+                       / self.config.max_time_seconds * unfinished_before)
             if any(t.status in (TaskStatus.MIGRATING, TaskStatus.INTERRUPTED)
                    for t in self.cluster.tasks.values()):
-                reward -= 0.01 * self.config.dt_seconds / self.config.max_time_seconds
+                reward -= 0.01 * dt_seconds / self.config.max_time_seconds
             emitted.extend(tick_events)
             emitted.extend(migration_events)
             emitted.extend(schedule_events)
 
         terminated = self.cluster.all_terminal()
+        if terminated and self.time_seconds < self.config.max_time_seconds:
+            fixed_window_events = self._advance_fixed_window()
+            emitted.extend(fixed_window_events)
+            reward += sum(self._event_reward(event) for event in fixed_window_events)
         truncated = self.time_seconds >= self.config.max_time_seconds and not terminated
         if truncated:
             for task in self.cluster.tasks.values():
@@ -197,6 +220,19 @@ class MigrationEnvironment:
             "focus_task_id": None if self.focus_task is None else self.focus_task.task_id,
         }
         return self.observation(), reward, terminated, truncated, info
+
+    def _advance_fixed_window(self) -> list[Event]:
+        """Continue only physical sampling after tasks terminate, through the horizon."""
+        emitted: list[Event] = []
+        while self.time_seconds < self.config.max_time_seconds:
+            dt_seconds = min(self.config.dt_seconds,
+                             self.config.max_time_seconds - self.time_seconds)
+            sample = self.disturbances.sample(list(self.cluster.nodes.values()), dt_seconds)
+            self.last_common_shock = sample.common_shock
+            self.cluster.network.update(self.disturbances)
+            self.time_seconds += dt_seconds
+            emitted.extend(self.cluster.advance(dt_seconds, sample, self.time_seconds))
+        return emitted
 
     def _schedule_pending(self) -> list[Event]:
         before = {t.task_id: t.status for t in self.cluster.tasks.values()}
@@ -224,7 +260,7 @@ class MigrationEnvironment:
         if event.kind == "task_failed":
             return -1.0
         if event.kind == "horizon_incomplete":
-            return -0.5
+            return -1.0
         if event.kind == "sla_violated":
             return -0.5
         if event.kind == "migration_aborted":

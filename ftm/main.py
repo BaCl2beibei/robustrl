@@ -7,7 +7,7 @@ import csv
 import statistics
 from pathlib import Path
 
-from .config import SimulationConfig
+from .config import ScenarioConfig, SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
 from .metrics import compute_episode_metrics
 from .policies import (GreedyPolicy, LoadBasedPolicy, NoMigrationPolicy, RandomPolicy,
@@ -16,7 +16,8 @@ from .robust_mdp import two_state_example
 
 
 POLICIES = ("all", "no_migration", "random", "greedy", "load_based", "robust_heuristic")
-SCENARIOS = ("normal", "failure", "network", "load", "mixed")
+SCENARIOS = ("normal", "failure", "network", "load", "load_short",
+            "load_medium", "load_sustained", "mixed")
 
 
 def make_policy(name: str, seed: int):
@@ -33,9 +34,10 @@ def make_policy(name: str, seed: int):
     raise ValueError(f"unknown policy: {name}")
 
 
-def run_episode(policy_name: str, scenario_name: str, seed: int,
+def run_episode(policy_name: str, scenario_name: str | ScenarioConfig, seed: int,
                 config: SimulationConfig):
-    scenario = scenario_by_name(scenario_name, config)
+    scenario = (scenario_name if isinstance(scenario_name, ScenarioConfig)
+                else scenario_by_name(scenario_name, config))
     env = MigrationEnvironment(config, scenario)
     env.reset(seed)
     policy = make_policy(policy_name, seed + 10_000)
@@ -95,7 +97,8 @@ def main() -> None:
             rows.append(metrics.to_dict())
             print(f"policy={policy_name} episode={episode + 1}/{args.episodes} seed={seed} "
                   f"completion={metrics.task_completion_rate:.3f} "
-                  f"continuation={_fmt(metrics.continuation_success_rate)} "
+                  f"node_failure_continuation="
+                  f"{_fmt(metrics.node_failure_continuation_success_rate)} "
                   f"availability={metrics.cluster_availability:.3f} "
                   f"migrations={metrics.migration_count}")
 
