@@ -13,6 +13,7 @@ from typing import Mapping, Sequence
 
 from .config import ScenarioConfig, SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
+from .observation import encode_observation
 from .robust_ppo import EpisodeResult, FiniteScenarioRobustPPO, PPOConfig
 from .surrogate import (PARAMETER_NAMES, scenario_to_raw, training_raw_bounds,
                         worst_case_scenario)
@@ -48,7 +49,7 @@ class SurrogatePGDRobustPPO(FiniteScenarioRobustPPO):
         torch = self.torch
         template = scenario_by_name(scenario_name, self.env_config)
         env = MigrationEnvironment(self.env_config, template)
-        observation, _ = env.reset(seed)
+        env.reset(seed)
         states, masks, actions, log_probs, values, rewards = [], [], [], [], [], []
         terminated_flags, boundaries = [], []
         total_reward = discounted_return = 0.0
@@ -73,9 +74,11 @@ class SurrogatePGDRobustPPO(FiniteScenarioRobustPPO):
             upper_bounds = tuple(float(value) for value in constraint["upper_bounds"])
 
         while True:
+            context = env.get_decision_context()
+            observation = encode_observation(context)
             state_tensor = torch.tensor(observation, dtype=torch.float32,
                                         device=self.device).unsqueeze(0)
-            mask_tuple = env.valid_action_mask()
+            mask_tuple = context.action_mask
             mask_tensor = torch.tensor(mask_tuple, dtype=torch.bool,
                                        device=self.device).unsqueeze(0)
             with torch.no_grad():

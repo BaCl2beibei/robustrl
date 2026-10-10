@@ -10,6 +10,7 @@ from pathlib import Path
 from .config import SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
 from .main import POLICIES, SCENARIOS, make_policy
+from .observation import SCHEMA_VERSION, encode_observation
 from .surrogate import perturb_scenario, scenario_to_raw
 
 
@@ -31,11 +32,14 @@ def collect(output: Path, config: SimulationConfig, episodes_per_scenario: int,
                 policy = make_policy(policy_name, run_seed + 30_000)
                 episode_records = []
                 while True:
-                    state = env.observation()
-                    action = policy.act(env)
+                    context = env.get_decision_context()
+                    state = encode_observation(context)
+                    action = policy.act(context)
                     next_state, reward, terminated, truncated, _ = env.step(action)
                     episode_records.append({
                         "state": list(state),
+                        "action_mask": list(context.action_mask),
+                        "observation_schema_version": SCHEMA_VERSION,
                         "action": int(action),
                         "parameters": list(scenario_to_raw(scenario)),
                         "next_state": list(next_state),

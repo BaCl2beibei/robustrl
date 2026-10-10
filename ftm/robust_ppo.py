@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .config import SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
+from .observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION, encode_observation
 
 
 def _torch():
@@ -57,6 +58,9 @@ class PPOConfig:
     entropy_coefficient: float = 0.01
     max_gradient_norm: float = 0.5
     scenario_history_size: int = 12
+    scenario_eval_interval: int = 10
+    scenario_eval_episodes: int = 3
+    random_scenario_probability: float = 0.2
 
     def __post_init__(self) -> None:
         if not 0.0 < self.gamma < 1.0:
@@ -67,6 +71,10 @@ class PPOConfig:
             raise ValueError("clip_ratio and learning_rate must be positive")
         if self.update_epochs < 1 or self.minibatch_size < 1:
             raise ValueError("update_epochs and minibatch_size must be positive")
+        if self.scenario_eval_interval < 1 or self.scenario_eval_episodes < 1:
+            raise ValueError("scenario evaluation interval and episodes must be positive")
+        if not 0.0 <= self.random_scenario_probability <= 1.0:
+            raise ValueError("random_scenario_probability must be in [0, 1]")
 
 
 @dataclass
@@ -85,8 +93,8 @@ class FiniteScenarioRobustPPO:
     def __init__(self, env_config: SimulationConfig | None = None,
                  ppo_config: PPOConfig | None = None,
                  scenario_names: tuple[str, ...] =
-                 ("normal", "failure", "network", "load_short", "load_medium",
-                  "load_sustained", "mixed"),
+                 ("normal", "failure", "network", "load", "load_short",
+                  "load_medium", "load_sustained", "mixed"),
                  device: str | None = None, seed: int = 2026) -> None:
         if not scenario_names:
             raise ValueError("scenario_names must not be empty")
@@ -100,6 +108,10 @@ class FiniteScenarioRobustPPO:
         self.model = None
         self.optimizer = None
         self.scenario_returns: dict[str, list[float]] = {name: [] for name in scenario_names}
+        self.scenario_evaluations: list[dict] = []
+        self.latest_evaluation_scores: dict[str, float] = {}
+        # Keep scenario exploration independent from simulator and PPO randomness.
+        self._scenario_rng = random.Random(seed ^ 0x5EED5CE)
 
     def train(self, episodes: int, model_path: str | Path | None = None,
               log_every: int = 10) -> list[EpisodeResult]:
@@ -109,7 +121,8 @@ class FiniteScenarioRobustPPO:
         initial_env = MigrationEnvironment(
             self.env_config, scenario_by_name(self.scenario_names[0], self.env_config)
         )
-        initial_obs, _ = initial_env.reset(self.seed)
+        initial_env.reset(self.seed)
+        initial_obs = encode_observation(initial_env.get_decision_context())
         self.model = _build_actor_critic(len(initial_obs), self.env_config.n_nodes + 1)
         self.model.to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(),
@@ -122,6 +135,9 @@ class FiniteScenarioRobustPPO:
             self._ppo_update(rollout)
             results.append(result)
             self.scenario_returns[scenario_name].append(result.discounted_return)
+            completed_episodes = episode + 1
+            if completed_episodes % self.ppo_config.scenario_eval_interval == 0:
+                self._evaluate_scenarios(completed_episodes)
             if log_every > 0 and ((episode + 1) % log_every == 0 or episode + 1 == episodes):
                 print(f"episode={episode + 1}/{episodes} scenario={scenario_name} "
                       f"discounted_return={result.discounted_return:.3f} "
@@ -134,6 +150,13 @@ class FiniteScenarioRobustPPO:
         # Initial coverage gives the adversary a score for each scenario.
         if episode_index < len(self.scenario_names):
             return self.scenario_names[episode_index]
+        if (len(self.scenario_names) > 1
+                and self._scenario_rng.random()
+                < self.ppo_config.random_scenario_probability):
+            return self._scenario_rng.choice(self.scenario_names)
+        if self.latest_evaluation_scores:
+            return min(self.latest_evaluation_scores,
+                       key=self.latest_evaluation_scores.get)
         scores = {}
         for name, returns in self.scenario_returns.items():
             recent = returns[-self.ppo_config.scenario_history_size:]
@@ -141,21 +164,91 @@ class FiniteScenarioRobustPPO:
                 scores[name] = statistics.mean(recent)
         return min(scores, key=scores.get) if scores else self.scenario_names[0]
 
+    def _evaluate_scenarios(self, completed_episodes: int) -> None:
+        """Evaluate the current policy without collecting rollouts or updating PPO."""
+        evaluation_index = completed_episodes // self.ppo_config.scenario_eval_interval - 1
+        seeds_per_evaluation = (len(self.scenario_names)
+                                * self.ppo_config.scenario_eval_episodes)
+        seed_base = (self.seed + (1 << 60)
+                     + evaluation_index * seeds_per_evaluation)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for scenario_index, scenario_name in enumerate(self.scenario_names):
+                returns = []
+                seeds = []
+                for repeat in range(self.ppo_config.scenario_eval_episodes):
+                    seed = (seed_base
+                            + scenario_index * self.ppo_config.scenario_eval_episodes
+                            + repeat)
+                    seeds.append(seed)
+                    returns.append(self._evaluate_episode(scenario_name, seed))
+                mean_return = statistics.mean(returns)
+                self.latest_evaluation_scores[scenario_name] = mean_return
+                record = {
+                    "after_episode": completed_episodes,
+                    "scenario": scenario_name,
+                    "evaluation_episodes": len(returns),
+                    "mean_discounted_return": mean_return,
+                    "seed_start": seeds[0],
+                    "seed_end": seeds[-1],
+                }
+                self.scenario_evaluations.append(record)
+                print(f"evaluation_after={completed_episodes} scenario={scenario_name} "
+                      f"episodes={len(returns)} "
+                      f"mean_discounted_return={mean_return:.3f}")
+        finally:
+            self.model.train(was_training)
+
+        worst_scenario = min(self.latest_evaluation_scores,
+                             key=self.latest_evaluation_scores.get)
+        print(f"evaluation_after={completed_episodes} "
+              f"priority_scenario={worst_scenario} "
+              f"mean_discounted_return="
+              f"{self.latest_evaluation_scores[worst_scenario]:.3f}")
+
+    def _evaluate_episode(self, scenario_name: str, seed: int) -> float:
+        """Run one deterministic-policy episode and return its discounted reward."""
+        torch = self.torch
+        env = MigrationEnvironment(
+            self.env_config, scenario_by_name(scenario_name, self.env_config)
+        )
+        env.reset(seed)
+        discounted_return = 0.0
+        discount = 1.0
+        while True:
+            context = env.get_decision_context()
+            state = torch.tensor(encode_observation(context), dtype=torch.float32,
+                                 device=self.device).unsqueeze(0)
+            mask = torch.tensor(context.action_mask, dtype=torch.bool,
+                                device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                logits, _ = self.model(state)
+                action = int(logits.masked_fill(~mask, -1.0e9)
+                             .argmax(dim=-1).item())
+            _, reward, terminated, truncated, _ = env.step(action)
+            discounted_return += discount * reward
+            discount *= self.ppo_config.gamma
+            if terminated or truncated:
+                return discounted_return
+
     def _collect_episode(self, scenario_name: str, seed: int, episode_number: int):
         torch = self.torch
         env = MigrationEnvironment(
             self.env_config, scenario_by_name(scenario_name, self.env_config)
         )
-        observation, _ = env.reset(seed)
+        env.reset(seed)
         states, masks, actions, log_probs, values, rewards = [], [], [], [], [], []
         terminated_flags, boundaries = [], []
         total_reward = 0.0
         discounted_return = 0.0
         discount = 1.0
         while True:
+            context = env.get_decision_context()
+            observation = encode_observation(context)
             state_tensor = torch.tensor(observation, dtype=torch.float32,
                                         device=self.device).unsqueeze(0)
-            mask_tuple = env.valid_action_mask()
+            mask_tuple = context.action_mask
             mask_tensor = torch.tensor(mask_tuple, dtype=torch.bool,
                                        device=self.device).unsqueeze(0)
             with torch.no_grad():
@@ -254,10 +347,17 @@ class FiniteScenarioRobustPPO:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.torch.save({
             "model_state_dict": self.model.state_dict(),
+            "observation_schema_version": SCHEMA_VERSION,
+            "feature_order": FEATURE_ORDER,
+            "feature_scales": FEATURE_SCALES,
+            "state_dim": self.model.body[0].in_features,
+            "action_dim": self.model.actor.out_features,
             "env_config": asdict(self.env_config),
             "ppo_config": asdict(self.ppo_config),
             "scenario_names": self.scenario_names,
             "seed": self.seed,
             "episodes": episodes,
             "scenario_returns": self.scenario_returns,
+            "scenario_evaluations": self.scenario_evaluations,
+            "latest_evaluation_scores": self.latest_evaluation_scores,
         }, path)

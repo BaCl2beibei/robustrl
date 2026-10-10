@@ -114,8 +114,8 @@ class OODScenarioTests(unittest.TestCase):
         self.assertEqual(row["disturbance_congestion_enter"], 0.50)
 
         class WaitController:
-            def act(self, env, observation):
-                return env.config.n_nodes
+            def act(self, context):
+                return len(context.nodes)
 
         _, trained_env = run_trained_episode("trained_surrogate_ppo", scenario, 3,
                                              self.config, WaitController())

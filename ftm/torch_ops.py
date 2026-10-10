@@ -77,7 +77,10 @@ def projected_adversarial_search(center, axes, alpha, objective,
     def project_to_intersection(z):
         norm = torch.linalg.vector_norm(z).clamp_min(1e-12)
         if z_lower is None or box_contains_ball:
-            return z / torch.maximum(norm, torch.ones_like(norm))
+            safe_radius = torch.as_tensor(1.0 - 1e-4, dtype=z.dtype,
+                                          device=z.device)
+            scale = torch.maximum(norm / safe_radius, torch.ones_like(norm))
+            return z / scale
 
         box_point = torch.maximum(torch.minimum(z, z_upper), z_lower)
         if torch.linalg.vector_norm(box_point) <= 1.0:
@@ -99,7 +102,15 @@ def projected_adversarial_search(center, axes, alpha, objective,
                 low = middle
             else:
                 high = middle
-        return torch.maximum(torch.minimum(z / (1.0 + high), z_upper), z_lower)
+        candidate = torch.maximum(
+            torch.minimum(z / (1.0 + high), z_upper), z_lower
+        )
+        candidate_norm = torch.linalg.vector_norm(candidate).clamp_min(1e-12)
+        safe_radius = torch.as_tensor(1.0 - 1e-4, dtype=z.dtype,
+                                      device=z.device)
+        scale = torch.maximum(candidate_norm / safe_radius,
+                              torch.ones_like(candidate_norm))
+        return candidate / scale
 
     if alpha == 0:
         return center, objective(center).detach()

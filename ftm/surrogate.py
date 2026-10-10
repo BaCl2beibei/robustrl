@@ -152,28 +152,95 @@ def _infer_state_layout(state_dim: int, action_dim: int) -> tuple[int, int]:
     n_nodes = action_dim - 1
     if n_nodes < 2:
         raise ValueError("action_dim must include at least two nodes and the wait action")
+    current_fixed = 10 + 15 * n_nodes + 5 * n_nodes * n_nodes
+    current_stride = 21 + 2 * n_nodes
+    if (state_dim - current_fixed >= current_stride
+            and (state_dim - current_fixed) % current_stride == 0):
+        return n_nodes, (state_dim - current_fixed) // current_stride
     # Node features (8 each), directed links (4 each), task state (16 + 2N),
     # global features (3), burst estimates (N), and migration progress (3/task).
     fixed = 4 * n_nodes * n_nodes + 9 * n_nodes + 3
     task_stride = 19 + 2 * n_nodes
     remaining = state_dim - fixed
-    if remaining < task_stride or remaining % task_stride:
-        raise ValueError("state dimension does not match MigrationEnvironment layout")
-    return n_nodes, remaining // task_stride
+    # New observations append one focus-task bit per task plus completion and
+    # migration-cost estimates. Keep recognizing legacy observations as well.
+    decision_feature_size = 2 * n_nodes + 2
+    extended_stride = task_stride + 1
+    extended_remaining = remaining - decision_feature_size
+    if (extended_remaining >= extended_stride
+            and extended_remaining % extended_stride == 0):
+        return n_nodes, extended_remaining // extended_stride
+    if remaining >= task_stride and remaining % task_stride == 0:
+        return n_nodes, remaining // task_stride
+    raise ValueError("state dimension does not match MigrationEnvironment layout")
+
+
+def _has_migration_decision_features(state_dim: int, n_nodes: int,
+                                     n_tasks: int) -> bool:
+    """Return whether a state dimension includes the appended decision features."""
+    fixed = 4 * n_nodes * n_nodes + 9 * n_nodes + 3
+    legacy_task_stride = 19 + 2 * n_nodes
+    extended_size = n_tasks + 2 * n_nodes + 2
+    return state_dim == fixed + n_tasks * legacy_task_stride + extended_size
 
 
 def project_predicted_next_state(predicted_state, action_dim: int):
     """Project a surrogate state onto the simulator's feature constraints.
 
-    Continuous features are clipped to their [0, 1] observation range with a
-    straight-through gradient. Binary features use a hard threshold with an
-    identity backward pass. One-hot groups use hard argmax in the forward pass
-    and softmax gradients in the backward pass, so the critic sees legal states
-    while PGD retains a gradient path.
+    Legacy and time-cost features are clipped to [0, 1], while relative time
+    savings and SLA slack are clipped to [-1, 1]. Straight-through gradients
+    preserve the PGD path. Binary and one-hot groups are projected to legal
+    values in the forward pass with differentiable backward approximations.
     """
     torch = _torch()
     n_nodes, n_tasks = _infer_state_layout(predicted_state.shape[-1], action_dim)
-    clipped = predicted_state.clamp(0.0, 1.0)
+    if (predicted_state.shape[-1] == 10 + 15 * n_nodes
+            + 5 * n_nodes * n_nodes + n_tasks * (21 + 2 * n_nodes)):
+        # Current schema has unbounded measured quantities. Only enforce
+        # non-negativity and categorical fields; never clip large bursts.
+        projected = predicted_state + (predicted_state.clamp_min(0)
+                                       - predicted_state).detach()
+        projected = projected.clone()
+        groups = [(1, n_tasks + 1)]
+        node_start = 9 + n_tasks
+        task_start = node_start + 14 * n_nodes
+        for task in range(n_tasks):
+            start = task_start + task * (20 + 2 * n_nodes)
+            groups.extend(((start + 10, 6), (start + 16, n_nodes + 1),
+                           (start + 17 + n_nodes, n_nodes + 1)))
+        for start, width in groups:
+            logits = predicted_state[..., start:start + width]
+            soft = torch.softmax(logits, dim=-1)
+            hard = torch.nn.functional.one_hot(
+                soft.argmax(dim=-1), num_classes=width).to(soft.dtype)
+            projected[..., start:start + width] = hard - soft.detach() + soft
+        binary = [node_start + node * 14 + 1 for node in range(n_nodes)]
+        binary.extend(task_start + task * (20 + 2 * n_nodes)
+                      + 19 + 2 * n_nodes for task in range(n_tasks))
+        link_start = task_start + n_tasks * (20 + 2 * n_nodes)
+        binary.extend(link_start + link * 5 + 2 for link in range(n_nodes * n_nodes))
+        binary.extend(range(predicted_state.shape[-1] - action_dim,
+                            predicted_state.shape[-1]))
+        for index in binary:
+            value = predicted_state[..., index]
+            hard = (value >= 0.5).to(value.dtype)
+            projected[..., index] = value + (hard - value).detach()
+        return projected
+    fixed = 4 * n_nodes * n_nodes + 9 * n_nodes + 3
+    legacy_task_stride = 19 + 2 * n_nodes
+    has_migration_features = _has_migration_decision_features(
+        predicted_state.shape[-1], n_nodes, n_tasks
+    )
+    feature_start = fixed + n_tasks * legacy_task_stride
+    clip_start = feature_start if has_migration_features else predicted_state.shape[-1]
+    clipped = predicted_state.clone()
+    clipped[..., :clip_start] = predicted_state[..., :clip_start].clamp(0.0, 1.0)
+    if has_migration_features:
+        signed_start = feature_start + n_tasks + 1 + n_nodes
+        clipped[..., feature_start: signed_start] = predicted_state[
+            ..., feature_start: signed_start
+        ].clamp(0.0, 1.0)
+        clipped[..., signed_start:] = predicted_state[..., signed_start:].clamp(-1.0, 1.0)
     projected = predicted_state + (clipped - predicted_state).detach()
     projected = projected.clone()
 
@@ -197,6 +264,10 @@ def project_predicted_next_state(predicted_state, action_dim: int):
     global_offset = task_offset + n_tasks * task_stride
     binary_indices.append(global_offset + 2)  # common-shock flag
 
+    focus_group = None
+    if has_migration_features:
+        focus_group = (feature_start, n_tasks)
+
     for index in binary_indices:
         value = predicted_state[..., index]
         hard = (value >= 0.5).to(dtype=value.dtype)
@@ -209,6 +280,19 @@ def project_predicted_next_state(predicted_state, action_dim: int):
             probabilities.argmax(dim=-1), num_classes=width
         ).to(dtype=probabilities.dtype)
         projected[..., start:start + width] = (
+            hard - probabilities.detach() + probabilities
+        )
+    if focus_group is not None:
+        start, width = focus_group
+        logits = predicted_state[..., start:start + width]
+        probabilities = torch.softmax(logits, dim=-1)
+        hard = torch.nn.functional.one_hot(
+            probabilities.argmax(dim=-1), num_classes=width
+        ).to(dtype=probabilities.dtype)
+        present = (logits.max(dim=-1, keepdim=True).values >= 0.5).to(
+            dtype=probabilities.dtype
+        )
+        projected[..., start:start + width] = present * (
             hard - probabilities.detach() + probabilities
         )
     return projected

@@ -12,6 +12,7 @@ from pathlib import Path
 from .config import SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
 from .ood_scenarios import scenario_family
+from .observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION
 from .robust_ppo import PPOConfig
 from .surrogate import (PARAMETER_NAMES, estimate_sensitivity_ellipsoid,
                         fit_surrogate, fit_value_model, scenario_to_raw,
@@ -123,10 +124,20 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     records = read_records(args.dataset)
+    if any(record.get("observation_schema_version") != SCHEMA_VERSION
+           for record in records):
+        raise ValueError("surrogate dataset observation schema is incompatible; regenerate it")
     config = SimulationConfig(max_time_seconds=args.max_time)
     probe_env = MigrationEnvironment(config, scenario_by_name("normal", config))
     state_dim = len(probe_env.reset(args.seed)[0])
     action_dim = config.n_nodes + 1
+    if any(len(record["state"]) != state_dim
+           or len(record["next_state"]) != state_dim
+           or len(record.get("action_mask", ())) != action_dim
+           or not 0 <= record["action"] < action_dim
+           or not record["action_mask"][record["action"]]
+           for record in records):
+        raise ValueError("surrogate dataset state, action or mask is incompatible")
     surrogate = fit_surrogate(records, action_dim, epochs=args.surrogate_epochs, device=device)
     value_model = fit_value_model(records, action_dim, epochs=args.value_epochs, device=device)
     center, axes, _, gradient = estimate_sensitivity_ellipsoid(
@@ -146,6 +157,9 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "policy_state_dict": trainer.model.state_dict(),
+        "observation_schema_version": SCHEMA_VERSION,
+        "feature_order": FEATURE_ORDER,
+        "feature_scales": FEATURE_SCALES,
         "surrogate_state_dict": surrogate.state_dict(),
         "state_dim": state_dim,
         "action_dim": action_dim,

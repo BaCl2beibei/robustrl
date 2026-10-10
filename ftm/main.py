@@ -43,7 +43,7 @@ def run_episode(policy_name: str, scenario_name: str | ScenarioConfig, seed: int
     policy = make_policy(policy_name, seed + 10_000)
     total_reward = 0.0
     while True:
-        action = policy.act(env)
+        action = policy.act(env.get_decision_context())
         _, reward, terminated, truncated, _ = env.step(action)
         total_reward += reward
         if terminated or truncated:

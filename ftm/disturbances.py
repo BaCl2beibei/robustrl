@@ -38,13 +38,9 @@ class DisturbanceModel:
     def predict_burst_remaining_seconds(self, node_id: int) -> float:
         if self.burst_remaining[node_id] <= 0.0:
             return 0.0
-        duration_min, duration_max = self.scenario.load_burst_duration_bounds(
-            self.config.dt_seconds
-        )
-        default_duration = (duration_min + duration_max) / 2.0
         return predict_burst_remaining(
             self.burst_elapsed_seconds[node_id], self.burst_history_seconds[node_id],
-            default_duration,
+            default_duration=5.0,
         )
 
     def sample(self, nodes: list[Node], dt_seconds: float) -> DisturbanceSample:

@@ -21,6 +21,9 @@ def main() -> None:
                         help="all enables finite-scenario adversarial PPO; one value trains a fixed-scenario PPO")
     parser.add_argument("--output", type=Path, default=Path("models/robust_ppo.pt"))
     parser.add_argument("--log", type=Path, default=Path("runs/robust_ppo_training.csv"))
+    parser.add_argument("--eval-log", type=Path,
+                        default=Path("runs/robust_ppo_evaluation.csv"),
+                        help="CSV path for periodic per-scenario evaluation results")
     parser.add_argument("--device", default=None, help="cpu, cuda, or omitted for auto")
     args = parser.parse_args()
     if args.episodes < 1:
@@ -37,8 +40,16 @@ def main() -> None:
         writer = csv.DictWriter(stream, fieldnames=list(asdict(results[0])))
         writer.writeheader()
         writer.writerows(asdict(result) for result in results)
+    args.eval_log.parent.mkdir(parents=True, exist_ok=True)
+    evaluation_fields = ("after_episode", "scenario", "evaluation_episodes",
+                         "mean_discounted_return", "seed_start", "seed_end")
+    with args.eval_log.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=evaluation_fields)
+        writer.writeheader()
+        writer.writerows(trainer.scenario_evaluations)
     print(f"model saved: {args.output.resolve()}")
     print(f"training log saved: {args.log.resolve()}")
+    print(f"evaluation log saved: {args.eval_log.resolve()}")
 
 
 if __name__ == "__main__":

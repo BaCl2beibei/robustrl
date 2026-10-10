@@ -46,7 +46,7 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         first = disturbances.sample(nodes, 1.0)
         self.assertTrue(first.load_burst)
         self.assertEqual(disturbances.burst_remaining, [1.0, 1.0])
-        self.assertEqual(disturbances.predict_burst_remaining_seconds(0), 1.0)
+        self.assertEqual(disturbances.predict_burst_remaining_seconds(0), 4.0)
         disturbances.sample(nodes, 1.0)
         self.assertEqual(disturbances.burst_history_seconds, [[2.0], [2.0]])
 
@@ -104,13 +104,18 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         self.assertAlmostEqual(state[4], 1.0)
         self.assertEqual(state[12], 0.0)
 
-    def test_observation_ratios_stay_in_unit_interval_for_short_horizon(self):
+    def test_observation_preserves_unbounded_values_and_focus(self):
         config = SimulationConfig(n_nodes=2, n_tasks=1, k_required=1,
                                   max_time_seconds=1.0,
                                   task_cpu_min=1.0, task_cpu_max=4.0)
         env = MigrationEnvironment(config, ScenarioConfig(name="quiet"))
         observation, _ = env.reset(seed=29)
-        self.assertTrue(all(0.0 <= value <= 1.0 for value in observation))
+        context = env.get_decision_context()
+        self.assertEqual(context.focus_task_id, env.focus_task.task_id)
+        self.assertEqual(context.action_mask, env.valid_action_mask())
+        self.assertEqual(observation[1:2], (1.0,))
+        self.assertIn(context.tasks[0].checkpoint_size_bytes / 1_000_000,
+                      observation)
         self.assertEqual(_infer_state_layout(len(observation), config.n_nodes + 1),
                          (config.n_nodes, config.n_tasks))
 
@@ -122,10 +127,11 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         env = MigrationEnvironment(config, ScenarioConfig(name="quiet"))
         observation, _ = env.reset(seed=23)
         n_nodes = config.n_nodes
-        task_offset = 8 * n_nodes + 4 * n_nodes * n_nodes
-        status_start = task_offset + 8
+        task_offset = 9 + config.n_tasks + 14 * n_nodes
+        status_start = task_offset + 10
         predicted = torch.tensor(observation, dtype=torch.float32).clone()
-        predicted[4] = 2.5  # the straight-through bound keeps the forward value legal
+        predicted[4] = 2.5  # unbounded measured values are retained
+        predicted[0] = -2.0
         predicted[status_start:status_start + 6] = torch.tensor(
             [0.1, 0.6, 0.2, 0.1, 0.0, 0.0]
         )
@@ -136,7 +142,9 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         status = projected[0, status_start:status_start + 6]
         self.assertAlmostEqual(float(status.sum()), 1.0)
         self.assertTrue(torch.all((status == 0.0) | (status == 1.0)).item())
-        self.assertTrue(torch.all((projected >= 0.0) & (projected <= 1.0)).item())
+        self.assertTrue(torch.all(projected >= 0.0).item())
+        self.assertAlmostEqual(float(projected[0, 4]), 2.5)
+        self.assertAlmostEqual(float(projected[0, 0]), 0.0)
 
         weights = torch.arange(projected.shape[-1], dtype=torch.float32)
         (projected * weights).sum().backward()
@@ -175,6 +183,37 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         horizon = MigrationEnvironment._event_reward(Event(1.0, "horizon_incomplete", 0))
         self.assertEqual(task_failure, horizon)
         self.assertEqual(task_failure, -1.0)
+
+    def test_reward_includes_dense_service_loss_and_progress(self):
+        interrupted_config = SimulationConfig(
+            n_nodes=2, n_tasks=1, k_required=1, max_time_seconds=10.0,
+            base_failure_rate=0.0, base_repair_rate=0.0,
+            task_work_min=100.0, task_work_max=100.0,
+            task_cpu_min=1.0, task_cpu_max=1.0,
+        )
+        quiet = ScenarioConfig(name="quiet", failure_multiplier=0.0,
+                               congestion_enter=0.0, load_burst_probability=0.0)
+        interrupted_env = MigrationEnvironment(interrupted_config, quiet)
+        interrupted_env.reset(seed=41)
+        task = next(iter(interrupted_env.cluster.tasks.values()))
+        interrupted_env.cluster.nodes[task.node_id].up = False
+        task.status = TaskStatus.INTERRUPTED
+        _, reward, _, _, _ = interrupted_env.step(interrupted_config.n_nodes)
+        self.assertAlmostEqual(reward, -0.15)
+        task.status = TaskStatus.MIGRATING
+        self.assertEqual(interrupted_env._service_loss_ratio(), 0.0)
+
+        progress_config = SimulationConfig(
+            n_nodes=2, n_tasks=1, k_required=1, max_time_seconds=10.0,
+            cpu_rate=100.0, base_failure_rate=0.0, base_repair_rate=0.0,
+            task_work_min=1.0, task_work_max=1.0,
+            task_cpu_min=1.0, task_cpu_max=1.0,
+        )
+        progress_env = MigrationEnvironment(progress_config, quiet)
+        progress_env.reset(seed=43)
+        _, reward, terminated, _, _ = progress_env.step(progress_config.n_nodes)
+        self.assertTrue(terminated)
+        self.assertAlmostEqual(reward, 1.2)
 
     def test_repaired_node_resumes_interrupted_task_with_existing_reservation(self):
         config = SimulationConfig(n_nodes=2, n_tasks=1, k_required=1,

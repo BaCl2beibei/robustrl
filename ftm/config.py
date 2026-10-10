@@ -53,6 +53,24 @@ class ScenarioConfig:
 
 
 @dataclass(frozen=True)
+class MonitoringConfig:
+    sample_interval_seconds: float = 1.0
+    reporting_delay_seconds: float = 0.0
+    cpu_noise_std: float = 0.0
+    memory_noise_std: float = 0.0
+    network_rtt_noise_std: float = 0.0
+    heartbeat_timeout_seconds: float = 3.0
+
+    def __post_init__(self) -> None:
+        if self.sample_interval_seconds <= 0 or self.heartbeat_timeout_seconds <= 0:
+            raise ValueError("monitoring intervals must be positive")
+        if any(value < 0 for value in (self.reporting_delay_seconds,
+                                      self.cpu_noise_std, self.memory_noise_std,
+                                      self.network_rtt_noise_std)):
+            raise ValueError("monitoring delay and noise must be non-negative")
+
+
+@dataclass(frozen=True)
 class SimulationConfig:
     n_nodes: int = 4
     n_tasks: int = 6
@@ -85,6 +103,9 @@ class SimulationConfig:
     task_memory_max: float = 12.0
     task_deadline_multiplier: float = 1.8
     delay_cost_weight: float = 0.5
+    service_loss_cost_weight: float = 1.0
+    progress_reward_weight: float = 0.25
+    monitoring: MonitoringConfig = MonitoringConfig()
 
     def __post_init__(self) -> None:
         if self.n_nodes < 2:
@@ -105,3 +126,7 @@ class SimulationConfig:
             raise ValueError("invalid task work interval")
         if self.delay_cost_weight < 0:
             raise ValueError("delay_cost_weight must be non-negative")
+        if self.service_loss_cost_weight < 0:
+            raise ValueError("service_loss_cost_weight must be non-negative")
+        if self.progress_reward_weight < 0:
+            raise ValueError("progress_reward_weight must be non-negative")
