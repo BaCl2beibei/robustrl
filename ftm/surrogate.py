@@ -50,21 +50,20 @@ def scenario_to_raw(scenario: ScenarioConfig) -> tuple[float, ...]:
 
 def raw_to_scenario(raw: Sequence[float], template: ScenarioConfig,
                     name: str = "pgd_adversarial") -> ScenarioConfig:
-    if len(raw) not in (6, len(PARAMETER_NAMES)):
-        raise ValueError("raw parameter vector must have six legacy or current entries")
+    if len(raw) != len(PARAMETER_NAMES):
+        raise ValueError("raw surrogate parameter vector must have exactly eight entries")
     values = [float(x) for x in raw]
     changes = dict(
         name=name,
-        failure_multiplier=softplus(values[0]) + 1e-8,
+        failure_multiplier=max(softplus(values[0]), 1e-12),
         congestion_enter=sigmoid(values[1]),
         congestion_leave=sigmoid(values[2]),
         common_shock_probability=sigmoid(values[3]),
         load_burst_probability=sigmoid(values[4]),
         load_burst_cpu=sigmoid(values[5]),
     )
-    if len(values) == len(PARAMETER_NAMES):
-        changes.update(disconnect_enter=sigmoid(values[6]),
-                       disconnect_leave=sigmoid(values[7]))
+    changes.update(disconnect_enter=sigmoid(values[6]),
+                   disconnect_leave=sigmoid(values[7]))
     return replace(template, **changes)
 
 
@@ -73,21 +72,19 @@ def perturb_scenario(template: ScenarioConfig, rng: random.Random,
     if raw_noise_std < 0:
         raise ValueError("raw_noise_std must be non-negative")
     raw = scenario_to_raw(template)
-    perturbed = [value + rng.gauss(0.0, raw_noise_std) for value in raw]
+    radius = 2.0 * raw_noise_std
+    perturbed = [min(value + radius,
+                      max(value - radius, value + rng.gauss(0.0, raw_noise_std)))
+                 for value in raw]
     return raw_to_scenario(perturbed, template, name=template.name + "_sample")
 
 
-def training_raw_bounds(template: ScenarioConfig, noise_std: float = 0.25,
-                        parameter_dim: int | None = None
+def training_raw_bounds(template: ScenarioConfig, noise_std: float = 0.25
                         ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Return the per-scenario raw-parameter region within two noise stddevs."""
     if noise_std < 0:
         raise ValueError("noise_std must be non-negative")
     center = scenario_to_raw(template)
-    if parameter_dim is not None:
-        if not 1 <= parameter_dim <= len(center):
-            raise ValueError("parameter_dim is outside the supported parameter range")
-        center = center[:parameter_dim]
     radius = 2.0 * noise_std
     return (tuple(value - radius for value in center),
             tuple(value + radius for value in center))
@@ -101,16 +98,17 @@ def _torch():
     return torch
 
 
-def build_transition_surrogate(state_dim: int, action_dim: int,
-                                parameter_dim: int = len(PARAMETER_NAMES)):
+def build_transition_surrogate(state_dim: int, action_dim: int):
     torch = _torch()
     nn = torch.nn
+    parameter_dim = len(PARAMETER_NAMES)
     input_dim = state_dim + action_dim + parameter_dim
 
     class TransitionSurrogate(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.action_dim = action_dim
+            self.parameter_dim = parameter_dim
             self.body = nn.Sequential(
                 nn.Linear(input_dim, 256), nn.ReLU(),
                 nn.Linear(256, 256), nn.ReLU(),
@@ -302,6 +300,9 @@ def _records_to_tensors(records: Sequence[Mapping], action_dim: int, device: str
     torch = _torch()
     if not records:
         raise ValueError("surrogate training needs transition records")
+    parameter_dimensions = {len(record.get("parameters", ())) for record in records}
+    if parameter_dimensions != {len(PARAMETER_NAMES)}:
+        raise ValueError("surrogate records must all contain exactly eight parameters")
     states = torch.tensor([r["state"] for r in records], dtype=torch.float32, device=device)
     actions = torch.tensor([r["action"] for r in records], dtype=torch.long, device=device)
     one_hot = torch.nn.functional.one_hot(actions, num_classes=action_dim).float()
@@ -325,8 +326,7 @@ def fit_surrogate(records: Sequence[Mapping], action_dim: int,
     states, one_hot, parameters, next_states, rewards, _, terminals = _records_to_tensors(
         records, action_dim, device
     )
-    model = build_transition_surrogate(states.shape[-1], action_dim,
-                                       parameter_dim=parameters.shape[-1]).to(device)
+    model = build_transition_surrogate(states.shape[-1], action_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     count = states.shape[0]
     for _ in range(epochs):
@@ -434,6 +434,11 @@ def worst_case_scenario(model, critic_value: Callable, state: Sequence[float],
     """PGD on the learned one-step Bellman surrogate; return physical parameters."""
     torch = _torch()
     from .torch_ops import projected_adversarial_search
+
+    if (len(center) != len(PARAMETER_NAMES) or len(axes) != len(PARAMETER_NAMES)
+            or (lower_bounds is not None and len(lower_bounds) != len(PARAMETER_NAMES))
+            or (upper_bounds is not None and len(upper_bounds) != len(PARAMETER_NAMES))):
+        raise ValueError("PGD center, axes and bounds must each have eight entries")
 
     state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
     action_tensor = torch.nn.functional.one_hot(

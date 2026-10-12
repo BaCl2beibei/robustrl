@@ -68,7 +68,9 @@ class TrainedPolicy:
                             device=self.device).unsqueeze(0)
         with torch.no_grad():
             logits, _ = self.model(state)
-            action = int(logits.masked_fill(~mask, -1.0e9).argmax(dim=-1).item())
+            masked_logits = logits.masked_fill(~mask, -1.0e9)
+            distribution = torch.distributions.Categorical(logits=masked_logits)
+            action = int(distribution.sample().item())
         return action
 
 

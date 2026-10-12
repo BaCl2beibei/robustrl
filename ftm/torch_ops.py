@@ -61,15 +61,21 @@ def projected_adversarial_search(center, axes, alpha, objective,
             raise ValueError("box bounds must match the ellipsoid dimension")
         if bool(torch.any(lower > upper)):
             raise ValueError("lower_bounds must not exceed upper_bounds")
-        if bool(torch.any(center < lower - 1e-7)) or bool(torch.any(center > upper + 1e-7)):
-            raise ValueError("ellipsoid center must lie inside the box for a feasible intersection")
         if alpha > 0:
             radius = alpha * axes
             z_lower = (lower - center) / radius
             z_upper = (upper - center) / radius
+            closest_feasible_z = torch.maximum(
+                torch.minimum(torch.zeros_like(center), z_upper), z_lower
+            )
+            if torch.linalg.vector_norm(closest_feasible_z) > 1.0:
+                raise ValueError("raw-space box does not intersect the PGD ellipsoid")
             box_contains_ball = (bool(torch.all(z_lower <= -1.0).item())
                                  and bool(torch.all(z_upper >= 1.0).item()))
         else:
+            if (bool(torch.any(center < lower - 1e-7))
+                    or bool(torch.any(center > upper + 1e-7))):
+                raise ValueError("zero-radius PGD point is outside the raw-space box")
             box_contains_ball = True
     else:
         box_contains_ball = True
@@ -77,9 +83,7 @@ def projected_adversarial_search(center, axes, alpha, objective,
     def project_to_intersection(z):
         norm = torch.linalg.vector_norm(z).clamp_min(1e-12)
         if z_lower is None or box_contains_ball:
-            safe_radius = torch.as_tensor(1.0 - 1e-4, dtype=z.dtype,
-                                          device=z.device)
-            scale = torch.maximum(norm / safe_radius, torch.ones_like(norm))
+            scale = torch.maximum(norm, torch.ones_like(norm))
             return z / scale
 
         box_point = torch.maximum(torch.minimum(z, z_upper), z_lower)
@@ -105,17 +109,16 @@ def projected_adversarial_search(center, axes, alpha, objective,
         candidate = torch.maximum(
             torch.minimum(z / (1.0 + high), z_upper), z_lower
         )
-        candidate_norm = torch.linalg.vector_norm(candidate).clamp_min(1e-12)
-        safe_radius = torch.as_tensor(1.0 - 1e-4, dtype=z.dtype,
-                                      device=z.device)
-        scale = torch.maximum(candidate_norm / safe_radius,
-                              torch.ones_like(candidate_norm))
-        return candidate / scale
+        return candidate
 
     if alpha == 0:
         return center, objective(center).detach()
-    best_point = center
-    best_value = objective(center).detach()
+    if lower_bounds is None:
+        best_point = center
+    else:
+        feasible_start = project_to_intersection(torch.zeros_like(center))
+        best_point = center + alpha * axes * feasible_start
+    best_value = objective(best_point).detach()
     dim = center.numel()
     initial_vectors = [torch.zeros_like(center)]
     for start in range(max(0, starts - 1)):

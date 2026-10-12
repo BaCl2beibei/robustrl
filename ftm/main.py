@@ -10,12 +10,13 @@ from pathlib import Path
 from .config import ScenarioConfig, SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
 from .metrics import compute_episode_metrics
-from .policies import (GreedyPolicy, LoadBasedPolicy, NoMigrationPolicy, RandomPolicy,
-                       RobustHeuristicPolicy)
+from .policies import (NoMigrationPolicy, RandomPolicy, ResourceMinPolicy,
+                       TimeMinPolicy, TimeResourceMinPolicy)
 from .robust_mdp import two_state_example
 
 
-POLICIES = ("all", "no_migration", "random", "greedy", "load_based", "robust_heuristic")
+POLICIES = ("all", "no_migration", "random", "time_min", "resource_min",
+            "time_resource_min")
 SCENARIOS = ("normal", "failure", "network", "load", "load_short",
             "load_medium", "load_sustained", "mixed")
 
@@ -25,12 +26,12 @@ def make_policy(name: str, seed: int):
         return NoMigrationPolicy()
     if name == "random":
         return RandomPolicy(seed)
-    if name == "greedy":
-        return GreedyPolicy()
-    if name == "load_based":
-        return LoadBasedPolicy()
-    if name == "robust_heuristic":
-        return RobustHeuristicPolicy()
+    if name == "time_min":
+        return TimeMinPolicy()
+    if name == "resource_min":
+        return ResourceMinPolicy()
+    if name == "time_resource_min":
+        return TimeResourceMinPolicy()
     raise ValueError(f"unknown policy: {name}")
 
 
@@ -69,7 +70,7 @@ def run_robust_demo() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("episodes", "robust-demo"), default="episodes")
-    parser.add_argument("--policy", choices=POLICIES, default="robust_heuristic")
+    parser.add_argument("--policy", choices=POLICIES, default="time_resource_min")
     parser.add_argument("--scenario", choices=SCENARIOS, default="mixed")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, default=2026)

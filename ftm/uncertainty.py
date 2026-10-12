@@ -101,32 +101,6 @@ def softplus(value: float) -> float:
     return max(value, 0.0) + math.log1p(math.exp(-abs(value)))
 
 
-def decode_robust_parameters(raw: Sequence[float], epsilon: float = 1e-8) -> dict[str, float]:
-    """Map ten unconstrained coordinates to legal physical parameters.
-
-    Order: failure rate, repair rate, congestion-enter probability,
-    congestion-leave probability, normal-delay mean, congested-delay increment,
-    normal-delay std, congested-delay std, bandwidth loss, burst probability.
-    """
-    if len(raw) != 10:
-        raise ValueError("raw robust parameter vector must have length 10")
-    failure_rate = softplus(raw[0]) + epsilon
-    repair_rate = softplus(raw[1]) + epsilon
-    normal_mean = softplus(raw[4]) + epsilon
-    return {
-        "failure_rate": failure_rate,
-        "repair_rate": repair_rate,
-        "congestion_enter": sigmoid(raw[2]),
-        "congestion_leave": sigmoid(raw[3]),
-        "normal_delay_mean": normal_mean,
-        "congested_delay_mean": normal_mean + softplus(raw[5]) + epsilon,
-        "normal_delay_std": softplus(raw[6]) + epsilon,
-        "congested_delay_std": softplus(raw[7]) + epsilon,
-        "bandwidth_loss": 0.95 * sigmoid(raw[8]),
-        "load_burst_probability": sigmoid(raw[9]),
-    }
-
-
 class RollingUncertaintyUpdater:
     """Update center, empirical parameter scales and sensitivity axes by window."""
 

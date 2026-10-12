@@ -46,12 +46,8 @@ def build_scenario_pgd_constraints(records: list[dict], surrogate, value_model,
                                    action_dim: int, config: SimulationConfig,
                                    scenario_names: tuple[str, ...], alpha: float,
                                    device: str) -> dict[str, dict]:
-    dimensions = {len(record["parameters"]) for record in records}
-    if len(dimensions) != 1:
-        raise ValueError("training records must use one consistent parameter dimension")
-    parameter_dim = dimensions.pop()
-    if parameter_dim not in (6, len(PARAMETER_NAMES)):
-        raise ValueError("training records must have six legacy or current parameters")
+    if any(len(record["parameters"]) != len(PARAMETER_NAMES) for record in records):
+        raise ValueError("training records must have exactly eight disturbance parameters")
 
     constraints_by_family = {}
     required_families = {scenario_family(name) for name in scenario_names}
@@ -73,13 +69,13 @@ def build_scenario_pgd_constraints(records: list[dict], surrogate, value_model,
             )
 
         template = scenario_by_name(family, config)
-        center = scenario_to_raw(template)[:parameter_dim]
+        center = scenario_to_raw(template)
         _, axes, _, gradient = estimate_sensitivity_ellipsoid(
             family_records, surrogate, value_model, action_dim,
             alpha=alpha, device=device, max_records=512,
             center_override=center,
         )
-        lower, upper = training_raw_bounds(template, parameter_dim=parameter_dim)
+        lower, upper = training_raw_bounds(template)
         constraints_by_family[family] = {
             "center": center,
             "axes": axes,
@@ -87,7 +83,7 @@ def build_scenario_pgd_constraints(records: list[dict], surrogate, value_model,
             "lower_bounds": lower,
             "upper_bounds": upper,
             "sensitivity_gradient": gradient,
-            "parameter_names": PARAMETER_NAMES[:parameter_dim],
+            "parameter_names": PARAMETER_NAMES,
         }
     return {
         name: constraints_by_family[scenario_family(name)]
@@ -105,14 +101,25 @@ def main() -> None:
     parser.add_argument("--surrogate-epochs", type=int, default=40)
     parser.add_argument("--value-epochs", type=int, default=40)
     parser.add_argument("--pgd-steps", type=int, default=8)
+    parser.add_argument("--warmup-fraction", type=float, default=0.2,
+                        help="fraction of episodes trained with ordinary PPO before PGD")
+    parser.add_argument("--pgd-step-fraction", type=float, default=0.2,
+                        help="maximum per-coordinate change as a fraction of its raw range")
+    parser.add_argument("--surrogate-refresh-interval", type=int, default=10,
+                        help="refresh the surrogate after this many PPO updates")
+    parser.add_argument("--surrogate-refresh-epochs", type=int, default=5)
     parser.add_argument("--output", type=Path, default=Path("models/surrogate_robust_ppo.pt"))
     parser.add_argument("--log", type=Path, default=Path("runs/surrogate_robust_ppo.csv"))
     parser.add_argument("--adversary-log", type=Path,
                         default=Path("runs/surrogate_pgd_summary.json"))
     parser.add_argument("--device", default=None, help="cpu, cuda, or omitted for auto")
     args = parser.parse_args()
-    if args.episodes < 1 or args.alpha < 0 or args.surrogate_epochs < 1 \
-            or args.value_epochs < 1 or args.pgd_steps < 1:
+    if (args.episodes < 1 or args.alpha < 0 or args.surrogate_epochs < 1
+            or args.value_epochs < 1 or args.pgd_steps < 1
+            or not 0.0 <= args.warmup_fraction < 1.0
+            or not 0.0 < args.pgd_step_fraction <= 1.0
+            or args.surrogate_refresh_interval < 1
+            or args.surrogate_refresh_epochs < 1):
         parser.error("episodes/epochs/PGD steps must be positive and alpha non-negative")
 
     try:
@@ -124,6 +131,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     records = read_records(args.dataset)
+    if {len(record["parameters"]) for record in records} != {len(PARAMETER_NAMES)}:
+        raise ValueError("surrogate dataset must contain exactly eight parameters per record")
     if any(record.get("observation_schema_version") != SCHEMA_VERSION
            for record in records):
         raise ValueError("surrogate dataset observation schema is incompatible; regenerate it")
@@ -147,10 +156,21 @@ def main() -> None:
         records, surrogate, value_model, action_dim, config,
         DEFAULT_PGD_SCENARIOS, args.alpha, device,
     )
+    warmup_episodes = 0
+    if args.episodes > 1 and args.warmup_fraction > 0:
+        warmup_episodes = min(
+            args.episodes - 1,
+            max(1, round(args.episodes * args.warmup_fraction)),
+        )
     trainer = SurrogatePGDRobustPPO(
         surrogate, center, axes, args.alpha, env_config=config, ppo_config=PPOConfig(),
         device=device, seed=args.seed, pgd_steps=args.pgd_steps,
         scenario_constraints=scenario_constraints,
+        warmup_episodes=warmup_episodes,
+        max_pgd_step_fraction=args.pgd_step_fraction,
+        surrogate_training_records=records,
+        surrogate_refresh_interval=args.surrogate_refresh_interval,
+        surrogate_refresh_epochs=args.surrogate_refresh_epochs,
     )
     results = trainer.train(args.episodes)
 
@@ -160,17 +180,22 @@ def main() -> None:
         "observation_schema_version": SCHEMA_VERSION,
         "feature_order": FEATURE_ORDER,
         "feature_scales": FEATURE_SCALES,
-        "surrogate_state_dict": surrogate.state_dict(),
+        "surrogate_state_dict": trainer.surrogate.state_dict(),
         "state_dim": state_dim,
         "action_dim": action_dim,
         "pgd_steps": args.pgd_steps,
         "center": center, "axes": axes, "alpha": args.alpha,
-        "parameter_names": PARAMETER_NAMES[:len(center)],
+        "parameter_names": PARAMETER_NAMES,
         "scenario_pgd_constraints": scenario_constraints,
         "sensitivity_gradient": gradient,
         "env_config": asdict(config), "ppo_config": asdict(trainer.ppo_config),
         "seed": args.seed, "episodes": args.episodes,
         "surrogate_dataset": str(args.dataset),
+        "warmup_episodes": trainer.warmup_episodes,
+        "pgd_episode_fraction_after_warmup": 0.5,
+        "max_pgd_step_fraction": args.pgd_step_fraction,
+        "surrogate_refresh_interval": args.surrogate_refresh_interval,
+        "surrogate_refresh_count": trainer.surrogate_refresh_count,
     }, args.output)
     args.log.parent.mkdir(parents=True, exist_ok=True)
     with args.log.open("w", newline="", encoding="utf-8") as stream:

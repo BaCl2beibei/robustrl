@@ -17,11 +17,11 @@ class ExperimentSuiteTests(unittest.TestCase):
         for seed, baseline, policy in ((1, 2.0, 3.0), (2, 1.0, 3.0), (3, 4.0, 5.0)):
             rows.append({"scenario": "normal", "policy": "no_migration", "seed": seed,
                          "task_completion_rate": baseline})
-            rows.append({"scenario": "normal", "policy": "greedy", "seed": seed,
+            rows.append({"scenario": "normal", "policy": "time_min", "seed": seed,
                          "task_completion_rate": policy})
         result = paired_bootstrap(rows, resamples=500)
         completion = next(row for row in result
-                          if row["policy"] == "greedy"
+                          if row["policy"] == "time_min"
                           and row["metric"] == "task_completion_rate")
         self.assertEqual(completion["n_pairs"], 3)
         self.assertAlmostEqual(completion["mean_difference"], 4.0 / 3.0)

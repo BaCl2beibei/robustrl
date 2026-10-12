@@ -85,7 +85,6 @@ def raw_coverage_diagnostics(cases: Sequence, config: SimulationConfig,
     if not 0.0 < central_quantile < 1.0 or noise_std < 0:
         raise ValueError("invalid coverage quantile or noise standard deviation")
     samples_by_family: dict[str, set[tuple[float, ...]]] = {}
-    dimensions_by_family: dict[str, set[int]] = {}
     if training_records is not None:
         for record in training_records:
             name = record.get("scenario")
@@ -97,8 +96,9 @@ def raw_coverage_diagnostics(cases: Sequence, config: SimulationConfig,
             except ValueError:
                 continue
             row = tuple(float(value) for value in parameters)
+            if len(row) != len(PARAMETER_NAMES):
+                raise ValueError("surrogate coverage records must use eight parameters")
             samples_by_family.setdefault(family, set()).add(row)
-            dimensions_by_family.setdefault(family, set()).add(len(row))
 
     tail = (1.0 - central_quantile) / 2.0
     normal_z = NormalDist().inv_cdf(1.0 - tail)
@@ -115,7 +115,6 @@ def raw_coverage_diagnostics(cases: Sequence, config: SimulationConfig,
             radius = normal_z * noise_std
             lower = tuple(value - radius for value in center)
             upper = tuple(value + radius for value in center)
-            parameter_dim = len(center)
             source = "theoretical_gaussian_interval"
         elif not family_samples:
             output.append({
@@ -130,25 +129,21 @@ def raw_coverage_diagnostics(cases: Sequence, config: SimulationConfig,
             })
             continue
         else:
-            dimensions = dimensions_by_family[family]
-            if len(dimensions) != 1:
-                raise ValueError(f"inconsistent raw parameter lengths for {family}")
-            parameter_dim = next(iter(dimensions))
-            samples = [row[:parameter_dim] for row in family_samples]
+            samples = list(family_samples)
             quantile_values = {}
-            for index, name in enumerate(PARAMETER_NAMES[:parameter_dim]):
+            for index, name in enumerate(PARAMETER_NAMES):
                 ordered = sorted(row[index] for row in samples)
                 quantile_values[name] = (
                     _empirical_quantile(ordered, tail),
                     _empirical_quantile(ordered, 1.0 - tail),
                 )
             lower = tuple(quantile_values[name][0]
-                          for name in PARAMETER_NAMES[:parameter_dim])
+                          for name in PARAMETER_NAMES)
             upper = tuple(quantile_values[name][1]
-                          for name in PARAMETER_NAMES[:parameter_dim])
+                          for name in PARAMETER_NAMES)
             source = "empirical_training_records"
 
-        names = PARAMETER_NAMES[:parameter_dim]
+        names = PARAMETER_NAMES
         parameter_report = {
             name: {
                 "training_low": lower[index],

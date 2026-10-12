@@ -238,7 +238,8 @@ class FiniteScenarioRobustPPO:
             self.env_config, scenario_by_name(scenario_name, self.env_config)
         )
         env.reset(seed)
-        states, masks, actions, log_probs, values, rewards = [], [], [], [], [], []
+        states, masks, actions, log_probs = [], [], [], []
+        values, rewards, next_states = [], [], []
         terminated_flags, boundaries = [], []
         total_reward = 0.0
         discounted_return = 0.0
@@ -258,6 +259,7 @@ class FiniteScenarioRobustPPO:
                 action = distribution.sample()
                 log_prob = distribution.log_prob(action)
             next_observation, reward, terminated, truncated, _ = env.step(int(action.item()))
+            next_states.append(tuple(next_observation))
             states.append(tuple(observation))
             masks.append(tuple(mask_tuple))
             actions.append(int(action.item()))
@@ -282,6 +284,7 @@ class FiniteScenarioRobustPPO:
         rollout = {
             "states": states, "masks": masks, "actions": actions,
             "log_probs": log_probs, "values": values, "rewards": rewards,
+            "next_states": next_states,
             "terminated": terminated_flags, "boundaries": boundaries,
             "final_value": final_value,
         }

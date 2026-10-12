@@ -1,12 +1,17 @@
-"""Simple migration baselines and a conservative worst-case heuristic."""
+"""Simple migration baselines with time and resource objectives."""
 
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 from typing import Protocol
 
 from .observation import DecisionContext, TaskObservation
-from .reliability import node_up_probability
+
+
+# Fixed from the project's default training horizon; keep it unchanged for OOD.
+TIME_REFERENCE_SECONDS = 600.0
+MIN_RELATIVE_IMPROVEMENT = 1e-3
 
 
 def predict_burst_remaining(elapsed_seconds: float,
@@ -50,6 +55,46 @@ def _predicted_execution_time(context: DecisionContext, task: TaskObservation,
     )
 
 
+def estimate_migration_time(context: DecisionContext, task: TaskObservation,
+                            target_id: int) -> float:
+    """Estimate checkpoint transfer, network, and restore time from public data."""
+    if task.node_id is None:
+        transfer_seconds = (task.checkpoint_size_bytes
+                            / max(1e-9, context.public_config.link_bandwidth_bytes_per_second))
+    else:
+        link = context.link(task.node_id, target_id)
+        transfer_seconds = (link.rtt_seconds + task.checkpoint_size_bytes
+                            / max(1e-9, link.effective_bandwidth))
+    return (transfer_seconds
+            + context.public_config.checkpoint_fixed_delay_seconds
+            + context.public_config.restore_delay_seconds)
+
+
+def estimate_completion_time(context: DecisionContext, task: TaskObservation,
+                             target_id: int) -> float:
+    """Estimate migration time plus remaining execution time on a target."""
+    migration_seconds = estimate_migration_time(context, task, target_id)
+    execution_seconds = _predicted_execution_time(
+        context, task, target_id, migration_seconds
+    )
+    return migration_seconds + execution_seconds
+
+
+def estimate_resource_score(context: DecisionContext, task: TaskObservation,
+                            target_id: int) -> float:
+    """Return post-migration CPU plus memory utilization using public observations."""
+    node = context.nodes[target_id]
+    cpu_after = node.cpu_utilization + task.cpu_need / max(1e-9, node.cpu_capacity)
+    memory_after = (node.memory_utilization
+                    + task.memory_need / max(1e-9, node.memory_capacity))
+    return cpu_after + memory_after
+
+
+def valid_targets(context: DecisionContext) -> list[int]:
+    """Return migration targets allowed by the shared public action mask."""
+    return [index for index, allowed in enumerate(context.action_mask[:-1]) if allowed]
+
+
 class Policy(Protocol):
     name: str
 
@@ -58,6 +103,30 @@ class Policy(Protocol):
 
 def _wait_action(context: DecisionContext) -> int:
     return len(context.nodes)
+
+
+def _score_improves(candidate: float, stay: float) -> bool:
+    """Require a small relative gain before moving an already-running task."""
+    margin = MIN_RELATIVE_IMPROVEMENT * max(1.0, abs(stay))
+    return candidate < stay - margin
+
+
+def _act_by_score(context: DecisionContext, score: Callable[[DecisionContext,
+                                                              TaskObservation, int], float],
+                  stay_score: Callable[[DecisionContext, TaskObservation], float]) -> int:
+    task = context.get_focus_task()
+    if task is None:
+        return _wait_action(context)
+    candidates = valid_targets(context)
+    if not candidates:
+        return _wait_action(context)
+
+    best_score, target = min((score(context, task, index), index)
+                             for index in candidates)
+    if (task.status == "running" and task.node_id is not None
+            and not _score_improves(best_score, stay_score(context, task))):
+        return _wait_action(context)
+    return target
 
 
 class NoMigrationPolicy:
@@ -78,102 +147,67 @@ class RandomPolicy:
         return self.rng.choice(valid) if valid else _wait_action(context)
 
 
-class GreedyPolicy:
-    """Choose the target with the lowest estimated transfer + execution time."""
+class TimeMinPolicy:
+    """Choose the target with minimum estimated migration plus execution time."""
 
-    name = "greedy"
-
-    def score(self, context: DecisionContext, task: TaskObservation,
-              target_id: int) -> float:
-        if task.node_id is None:
-            transfer = (task.checkpoint_size_bytes
-                        / context.public_config.link_bandwidth_bytes_per_second)
-        else:
-            link = context.link(task.node_id, target_id)
-            transfer = (link.rtt_seconds + task.checkpoint_size_bytes
-                        / max(1e-9, link.effective_bandwidth))
-        migration_seconds = (transfer
-                             + context.public_config.checkpoint_fixed_delay_seconds
-                             + context.public_config.restore_delay_seconds)
-        execution_seconds = _predicted_execution_time(
-            context, task, target_id, migration_seconds
-        )
-        return migration_seconds + execution_seconds
-
-    def act(self, context: DecisionContext) -> int:
-        task = context.get_focus_task()
-        if task is None:
-            return _wait_action(context)
-        candidates = [i for i, ok in enumerate(context.action_mask[:-1]) if ok]
-        if not candidates:
-            return _wait_action(context)
-        target = min(candidates, key=lambda i: (self.score(context, task, i), i))
-        best = self.score(context, task, target)
-        if task.status == "running" and task.node_id is not None:
-            stay = _predicted_execution_time(context, task, task.node_id)
-            if best >= stay:
-                return _wait_action(context)
-        return target
-
-
-class LoadBasedPolicy(GreedyPolicy):
-    name = "load_based"
-
-    def act(self, context: DecisionContext) -> int:
-        task = context.get_focus_task()
-        if task is None:
-            return _wait_action(context)
-        candidates = [i for i, ok in enumerate(context.action_mask[:-1]) if ok]
-        if not candidates:
-            return _wait_action(context)
-        target = min(candidates, key=lambda i: (
-            context.nodes[i].cpu_utilization + context.nodes[i].memory_utilization,
-            self.score(context, task, i), i
-        ))
-        if task.status == "running" and task.node_id is not None:
-            stay_seconds = _predicted_execution_time(context, task, task.node_id)
-            if self.score(context, task, target) >= stay_seconds * 0.9:
-                return _wait_action(context)
-        return target
-
-
-class RobustHeuristicPolicy(GreedyPolicy):
-    """Finite conservative baseline; it is not the learned robust-MDP policy."""
-
-    name = "robust_heuristic"
+    name = "time_min"
 
     def score(self, context: DecisionContext, task: TaskObservation,
               target_id: int) -> float:
-        node = context.nodes[target_id]
-        link = (None if task.node_id is None else context.link(task.node_id, target_id))
-        bandwidth = context.public_config.link_bandwidth_bytes_per_second * 0.35
-        delay = (context.public_config.congested_delay_mean_seconds
-                 + 2 * context.public_config.congested_delay_std_seconds)
-        transfer = (context.public_config.checkpoint_fixed_delay_seconds
-                    + context.public_config.restore_delay_seconds)
-        transfer += task.checkpoint_size_bytes / bandwidth
-        transfer += delay if link is not None else 0.0
-        migration_seconds = transfer
-        time_to_complete = _predicted_execution_time(
-            context, task, target_id, migration_seconds
-        )
-        target_up_prob = node_up_probability(True,
-                                             node.failure_rate_estimate,
-                                             node.repair_rate_estimate,
-                                             migration_seconds + time_to_complete)
-        risk_penalty = (1.0 - target_up_prob) * max(1.0, time_to_complete)
-        return migration_seconds + time_to_complete + risk_penalty
+        return estimate_completion_time(context, task, target_id)
 
     def act(self, context: DecisionContext) -> int:
-        task = context.get_focus_task()
-        if task is None:
-            return _wait_action(context)
-        candidates = [i for i, ok in enumerate(context.action_mask[:-1]) if ok]
-        if not candidates:
-            return _wait_action(context)
-        target = min(candidates, key=lambda i: (self.score(context, task, i), i))
-        if task.status == "running" and task.node_id is not None:
-            stay_seconds = _predicted_execution_time(context, task, task.node_id)
-            if self.score(context, task, target) >= 0.8 * stay_seconds:
-                return _wait_action(context)
-        return target
+        return _act_by_score(
+            context, self.score,
+            lambda ctx, task: _predicted_execution_time(ctx, task, task.node_id),
+        )
+
+
+class ResourceMinPolicy:
+    """Choose the target with minimum post-migration CPU and memory utilization."""
+
+    name = "resource_min"
+
+    def score(self, context: DecisionContext, task: TaskObservation,
+              target_id: int) -> float:
+        return estimate_resource_score(context, task, target_id)
+
+    def act(self, context: DecisionContext) -> int:
+        return _act_by_score(
+            context, self.score,
+            lambda ctx, task: (ctx.nodes[task.node_id].cpu_utilization
+                               + ctx.nodes[task.node_id].memory_utilization),
+        )
+
+
+class TimeResourceMinPolicy:
+    """Minimize a normalized weighted sum of time and target resource use."""
+
+    name = "time_resource_min"
+
+    def __init__(self, alpha: float = 0.5,
+                 time_reference_seconds: float = TIME_REFERENCE_SECONDS) -> None:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        if time_reference_seconds <= 0:
+            raise ValueError("time_reference_seconds must be positive")
+        self.alpha = alpha
+        self.time_reference_seconds = time_reference_seconds
+
+    def score(self, context: DecisionContext, task: TaskObservation,
+              target_id: int) -> float:
+        normalized_time = (estimate_completion_time(context, task, target_id)
+                           / self.time_reference_seconds)
+        normalized_resource = estimate_resource_score(context, task, target_id) / 2.0
+        return (self.alpha * normalized_time
+                + (1.0 - self.alpha) * normalized_resource)
+
+    def act(self, context: DecisionContext) -> int:
+        def stay_score(ctx: DecisionContext, task: TaskObservation) -> float:
+            execution_seconds = _predicted_execution_time(ctx, task, task.node_id)
+            node = ctx.nodes[task.node_id]
+            resource_score = node.cpu_utilization + node.memory_utilization
+            return (self.alpha * execution_seconds / self.time_reference_seconds
+                    + (1.0 - self.alpha) * resource_score / 2.0)
+
+        return _act_by_score(context, self.score, stay_score)

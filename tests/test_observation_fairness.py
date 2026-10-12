@@ -6,8 +6,8 @@ from dataclasses import FrozenInstanceError
 from ftm.config import MonitoringConfig, ScenarioConfig, SimulationConfig
 from ftm.environment import MigrationEnvironment
 from ftm.observation import SCHEMA_VERSION, encode_observation
-from ftm.policies import (GreedyPolicy, LoadBasedPolicy, NoMigrationPolicy,
-                          RandomPolicy, RobustHeuristicPolicy)
+from ftm.policies import (NoMigrationPolicy, RandomPolicy, ResourceMinPolicy,
+                          TimeMinPolicy, TimeResourceMinPolicy)
 
 
 class ObservationFairnessTests(unittest.TestCase):
@@ -28,8 +28,8 @@ class ObservationFairnessTests(unittest.TestCase):
                          env.manager.valid_targets(env.focus_task, env.cluster))
         with self.assertRaises(FrozenInstanceError):
             context.nodes[0].online = False
-        for policy in (NoMigrationPolicy(), RandomPolicy(1), GreedyPolicy(),
-                       LoadBasedPolicy(), RobustHeuristicPolicy()):
+        for policy in (NoMigrationPolicy(), RandomPolicy(1), TimeMinPolicy(),
+                       ResourceMinPolicy(), TimeResourceMinPolicy()):
             self.assertTrue(context.action_mask[policy.act(context)])
 
     def test_hidden_scenario_change_cannot_change_current_observation(self):

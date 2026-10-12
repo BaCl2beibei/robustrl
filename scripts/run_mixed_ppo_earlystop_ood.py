@@ -33,8 +33,8 @@ from ftm.robust_ppo import (FiniteScenarioRobustPPO, PPOConfig,
 from ftm.trained_policy import TrainedPolicy, run_trained_episode
 
 
-BASELINES = ("no_migration", "random", "greedy", "load_based",
-             "robust_heuristic")
+BASELINES = ("no_migration", "random", "time_min", "resource_min",
+             "time_resource_min")
 METRICS = ("task_completion_rate", "task_service_availability",
            "sla_violation_rate", "migration_count", "total_reward")
 
@@ -270,7 +270,7 @@ def train(root: Path, args: argparse.Namespace, config: SimulationConfig,
     return selected
 
 
-def _summarize_ood(root: Path, rows: list[dict], resamples: int,
+def _summarize_ood(output_dir: Path, rows: list[dict], resamples: int,
                    seed: int) -> None:
     groups: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
@@ -284,7 +284,7 @@ def _summarize_ood(root: Path, rows: list[dict], resamples: int,
                               "metric": metric, "n": len(values),
                               "mean": statistics.mean(values),
                               "ci95_low": low, "ci95_high": high})
-    _write_csv(root / "ood" / "summary.csv", summaries)
+    _write_csv(output_dir / "summary.csv", summaries)
     by_key = {(row["scenario_id"], row["seed"], row["policy"]): row
               for row in rows}
     paired = []
@@ -302,7 +302,7 @@ def _summarize_ood(root: Path, rows: list[dict], resamples: int,
                                "metric": metric, "n_pairs": len(differences),
                                "ppo_minus_baseline": statistics.mean(differences),
                                "ci95_low": low, "ci95_high": high})
-    _write_csv(root / "ood" / "paired_vs_baselines.csv", paired)
+    _write_csv(output_dir / "paired_vs_baselines.csv", paired)
     macro = []
     for policy in (*BASELINES, "ordinary_ppo"):
         for metric in METRICS:
@@ -311,12 +311,13 @@ def _summarize_ood(root: Path, rows: list[dict], resamples: int,
             macro.append({"policy": policy, "metric": metric,
                           "ood_conditions": len(values),
                           "macro_mean": statistics.mean(values)})
-    _write_csv(root / "ood" / "macro_summary.csv", macro)
+    _write_csv(output_dir / "macro_summary.csv", macro)
 
 
 def evaluate_ood(root: Path, args: argparse.Namespace,
                  config: SimulationConfig, selected: dict) -> None:
-    if (root / "ood" / "episodes.csv").exists():
+    output_dir = args.ood_output_dir or root / "ood"
+    if (output_dir / "episodes.csv").exists():
         raise FileExistsError("OOD results already exist; choose a fresh output directory")
     cases = build_evaluation_cases("ood", "all", "all", config)
     if len(cases) != 10:
@@ -331,6 +332,8 @@ def evaluate_ood(root: Path, args: argparse.Namespace,
             run_seed = args.ood_seed + index
             for name in (*BASELINES, "ordinary_ppo"):
                 if name == "ordinary_ppo":
+                    import torch
+                    torch.manual_seed(run_seed)
                     metrics, _ = run_trained_episode(name, case.scenario,
                                                      run_seed, config, controller)
                 else:
@@ -338,9 +341,9 @@ def evaluate_ood(root: Path, args: argparse.Namespace,
                 rows.append(_episode_row(metrics, case))
         print(f"OOD_CONDITION_COMPLETE scenario={case.scenario_id} "
               f"paired_seeds={args.ood_episodes}", flush=True)
-    _write_csv(root / "ood" / "episodes.csv", rows)
-    _summarize_ood(root, rows, args.bootstrap_resamples, args.ood_seed)
-    _write_json(root / "ood" / "evaluation_config.json", {
+    _write_csv(output_dir / "episodes.csv", rows)
+    _summarize_ood(output_dir, rows, args.bootstrap_resamples, args.ood_seed)
+    _write_json(output_dir / "evaluation_config.json", {
         "checkpoint": selected["checkpoint"],
         "selected_on": selected["selection_metric"],
         "ood_seed_start": args.ood_seed,
@@ -348,9 +351,10 @@ def evaluate_ood(root: Path, args: argparse.Namespace,
         "episodes_per_condition_per_policy": args.ood_episodes,
         "cases": [case.scenario_id for case in cases],
         "policies": [*BASELINES, "ordinary_ppo"],
+        "action_selection": "categorical_sampling",
         "device": args.device, "observation_schema_version": SCHEMA_VERSION,
     })
-    with (root / "ood" / "OOD_COMPLETE.txt").open("x", encoding="utf-8") as stream:
+    with (output_dir / "OOD_COMPLETE.txt").open("x", encoding="utf-8") as stream:
         stream.write(f"episodes={len(rows)}\nconditions={len(cases)}\n")
 
 
@@ -376,6 +380,8 @@ def main() -> None:
     parser.add_argument("--min-delta", type=float, default=0.01)
     parser.add_argument("--validation-episodes", type=int, default=100)
     parser.add_argument("--ood-episodes", type=int, default=100)
+    parser.add_argument("--ood-output-dir", type=Path,
+                        help="destination for OOD results; defaults to <output-dir>/ood")
     parser.add_argument("--train-seed", type=int, default=2026)
     parser.add_argument("--validation-seed", type=int, default=20_026)
     parser.add_argument("--ood-seed", type=int, default=30_026)

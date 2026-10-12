@@ -271,7 +271,7 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         _, second_reward, terminated, truncated, _ = env.step(config.n_nodes)
         reward += second_reward
 
-        metrics = compute_episode_metrics(env, "greedy", 13, reward)
+        metrics = compute_episode_metrics(env, "time_min", 13, reward)
         self.assertFalse(terminated)
         self.assertTrue(truncated)
         self.assertEqual(metrics.migration_attempt_count, 1)

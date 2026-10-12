@@ -126,7 +126,7 @@ class OODScenarioTests(unittest.TestCase):
         for scenario_id, split, severity, score in (
                 ("load", "id", "base", 1.0),
                 ("load__ood_l1", "ood", "l1", 0.2)):
-            for policy, value in (("no_migration", score), ("greedy", score + 0.1)):
+            for policy, value in (("no_migration", score), ("time_min", score + 0.1)):
                 rows.append({
                     "scenario": scenario_id,
                     "scenario_id": scenario_id,
