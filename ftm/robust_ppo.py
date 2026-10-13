@@ -12,7 +12,7 @@ import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .config import SimulationConfig
+from .config import ScenarioConfig, SimulationConfig
 from .environment import MigrationEnvironment, scenario_by_name
 from .observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION, encode_observation
 
@@ -232,10 +232,11 @@ class FiniteScenarioRobustPPO:
             if terminated or truncated:
                 return discounted_return
 
-    def _collect_episode(self, scenario_name: str, seed: int, episode_number: int):
+    def _collect_episode(self, scenario_name: str, seed: int, episode_number: int,
+                         scenario_config: ScenarioConfig | None = None):
         torch = self.torch
         env = MigrationEnvironment(
-            self.env_config, scenario_by_name(scenario_name, self.env_config)
+            self.env_config, scenario_config or scenario_by_name(scenario_name, self.env_config)
         )
         env.reset(seed)
         states, masks, actions, log_probs = [], [], [], []
@@ -292,28 +293,39 @@ class FiniteScenarioRobustPPO:
                              total_reward, len(actions)), rollout
 
     def _ppo_update(self, rollout: dict) -> None:
+        self._ppo_update_many([rollout])
+
+    def _ppo_update_many(self, rollouts: list[dict]) -> None:
+        """Update from complete episodes once the rollout step budget is met."""
         torch = self.torch
         cfg = self.ppo_config
-        rewards = rollout["rewards"]
-        values = rollout["values"]
-        boundaries = rollout["boundaries"]
-        terminated = rollout["terminated"]
-        advantages = [0.0] * len(rewards)
-        gae = 0.0
-        next_value = rollout["final_value"]
-        for index in reversed(range(len(rewards))):
-            bootstrap = 0.0 if terminated[index] else next_value
-            delta = rewards[index] + cfg.gamma * bootstrap - values[index]
-            continuation = 0.0 if boundaries[index] else 1.0
-            gae = delta + cfg.gamma * cfg.gae_lambda * continuation * gae
-            advantages[index] = gae
-            next_value = values[index]
-        returns = [adv + value for adv, value in zip(advantages, values)]
-
-        states = torch.tensor(rollout["states"], dtype=torch.float32, device=self.device)
-        masks = torch.tensor(rollout["masks"], dtype=torch.bool, device=self.device)
-        actions = torch.tensor(rollout["actions"], dtype=torch.long, device=self.device)
-        old_log_probs = torch.tensor(rollout["log_probs"], dtype=torch.float32,
+        merged = {key: [] for key in ("states", "masks", "actions", "log_probs")}
+        advantages, returns = [], []
+        for rollout in rollouts:
+            rewards = rollout["rewards"]
+            values = rollout["values"]
+            boundaries = rollout["boundaries"]
+            terminated = rollout["terminated"]
+            episode_advantages = [0.0] * len(rewards)
+            gae = 0.0
+            next_value = rollout["final_value"]
+            for index in reversed(range(len(rewards))):
+                bootstrap = 0.0 if terminated[index] else next_value
+                delta = rewards[index] + cfg.gamma * bootstrap - values[index]
+                continuation = 0.0 if boundaries[index] else 1.0
+                gae = delta + cfg.gamma * cfg.gae_lambda * continuation * gae
+                episode_advantages[index] = gae
+                next_value = values[index]
+            advantages.extend(episode_advantages)
+            returns.extend(adv + value for adv, value in zip(episode_advantages, values))
+            for key in merged:
+                merged[key].extend(rollout[key])
+        if not advantages:
+            raise ValueError("PPO update requires at least one decision")
+        states = torch.tensor(merged["states"], dtype=torch.float32, device=self.device)
+        masks = torch.tensor(merged["masks"], dtype=torch.bool, device=self.device)
+        actions = torch.tensor(merged["actions"], dtype=torch.long, device=self.device)
+        old_log_probs = torch.tensor(merged["log_probs"], dtype=torch.float32,
                                      device=self.device)
         adv = torch.tensor(advantages, dtype=torch.float32, device=self.device)
         target_values = torch.tensor(returns, dtype=torch.float32, device=self.device)

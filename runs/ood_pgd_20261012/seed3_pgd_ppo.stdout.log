@@ -1,0 +1,79 @@
+PGD_BLOCK_COMPLETE seed=3 block=1
+PGD_BLOCK_COMPLETE seed=3 block=2
+PGD_BLOCK_COMPLETE seed=3 block=3
+PGD_BLOCK_COMPLETE seed=3 block=4
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=3000 score=0.945173
+PGD_BLOCK_COMPLETE seed=3 block=5
+PGD_BLOCK_COMPLETE seed=3 block=6
+PGD_BLOCK_COMPLETE seed=3 block=7
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=4000 score=0.946703
+PGD_BLOCK_COMPLETE seed=3 block=8
+PGD_BLOCK_COMPLETE seed=3 block=9
+PGD_BLOCK_COMPLETE seed=3 block=10
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=5000 score=0.944976
+PGD_BLOCK_COMPLETE seed=3 block=11
+PGD_BLOCK_COMPLETE seed=3 block=12
+PGD_BLOCK_COMPLETE seed=3 block=13
+PGD_BLOCK_COMPLETE seed=3 block=14
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=6000 score=0.944198
+PGD_BLOCK_COMPLETE seed=3 block=15
+PGD_BLOCK_COMPLETE seed=3 block=16
+PGD_BLOCK_COMPLETE seed=3 block=17
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=7000 score=0.944987
+PGD_BLOCK_COMPLETE seed=3 block=18
+PGD_BLOCK_COMPLETE seed=3 block=19
+PGD_BLOCK_COMPLETE seed=3 block=20
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=8000 score=0.944852
+PGD_BLOCK_COMPLETE seed=3 block=21
+PGD_BLOCK_COMPLETE seed=3 block=22
+PGD_BLOCK_COMPLETE seed=3 block=23
+PGD_BLOCK_COMPLETE seed=3 block=24
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=9000 score=0.941618
+PGD_BLOCK_COMPLETE seed=3 block=25
+PGD_BLOCK_COMPLETE seed=3 block=26
+PGD_BLOCK_COMPLETE seed=3 block=27
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=10000 score=0.943690
+PGD_BLOCK_COMPLETE seed=3 block=28
+PGD_BLOCK_COMPLETE seed=3 block=29
+PGD_BLOCK_COMPLETE seed=3 block=30
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=11000 score=0.942489
+PGD_BLOCK_COMPLETE seed=3 block=31
+PGD_BLOCK_COMPLETE seed=3 block=32
+PGD_BLOCK_COMPLETE seed=3 block=33
+PGD_BLOCK_COMPLETE seed=3 block=34
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=12000 score=0.940946
+PGD_BLOCK_COMPLETE seed=3 block=35
+PGD_BLOCK_COMPLETE seed=3 block=36
+PGD_BLOCK_COMPLETE seed=3 block=37
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=13000 score=0.944709
+PGD_BLOCK_COMPLETE seed=3 block=38
+PGD_BLOCK_COMPLETE seed=3 block=39
+PGD_BLOCK_COMPLETE seed=3 block=40
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=14000 score=0.941243
+PGD_BLOCK_COMPLETE seed=3 block=41
+PGD_BLOCK_COMPLETE seed=3 block=42
+PGD_BLOCK_COMPLETE seed=3 block=43
+PGD_BLOCK_COMPLETE seed=3 block=44
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=15000 score=0.942208
+PGD_BLOCK_COMPLETE seed=3 block=45
+PGD_BLOCK_COMPLETE seed=3 block=46
+PGD_BLOCK_COMPLETE seed=3 block=47
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=16000 score=0.944978
+PGD_BLOCK_COMPLETE seed=3 block=48
+PGD_BLOCK_COMPLETE seed=3 block=49
+PGD_BLOCK_COMPLETE seed=3 block=50
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=17000 score=0.943992
+PGD_BLOCK_COMPLETE seed=3 block=51
+PGD_BLOCK_COMPLETE seed=3 block=52
+PGD_BLOCK_COMPLETE seed=3 block=53
+PGD_BLOCK_COMPLETE seed=3 block=54
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=18000 score=0.944175
+PGD_BLOCK_COMPLETE seed=3 block=55
+PGD_BLOCK_COMPLETE seed=3 block=56
+PGD_BLOCK_COMPLETE seed=3 block=57
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=19000 score=0.944341
+PGD_BLOCK_COMPLETE seed=3 block=58
+PGD_BLOCK_COMPLETE seed=3 block=59
+PGD_BLOCK_COMPLETE seed=3 block=60
+CHECKPOINT_VALIDATED seed=3 method=pgd_ppo episode=20000 score=0.939843
+BRANCH_COMPLETE seed=3 method=pgd_ppo

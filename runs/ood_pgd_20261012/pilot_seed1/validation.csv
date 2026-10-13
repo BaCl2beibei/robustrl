@@ -1,0 +1,7 @@
+method,episode,score,best_episode,checkpoint
+ppo,3000,0.9405295606387811,2000,ppo\episode_03000.pt
+ppo,4000,0.9435216767922169,4000,ppo\episode_04000.pt
+ppo,5000,0.9414942340843969,4000,ppo\episode_05000.pt
+pgd_ppo,3000,0.9401464848788764,2000,pgd_ppo\episode_03000.pt
+pgd_ppo,4000,0.9424936887491999,4000,pgd_ppo\episode_04000.pt
+pgd_ppo,5000,0.9410406716134744,4000,pgd_ppo\episode_05000.pt

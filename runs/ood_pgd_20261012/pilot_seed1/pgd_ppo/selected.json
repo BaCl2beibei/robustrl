@@ -1,0 +1,5 @@
+{
+  "checkpoint": "pgd_ppo\\episode_04000.pt",
+  "score": 0.9424936887491999,
+  "selection": "fixed independent ID seeds; completion + availability + (1-SLA)"
+}
