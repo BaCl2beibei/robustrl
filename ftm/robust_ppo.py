@@ -39,7 +39,7 @@ def _build_actor_critic(state_dim: int, action_dim: int):
             self.actor = nn.Linear(128, action_dim)
             self.critic = nn.Linear(128, 1)
 
-        def forward(self, states):
+        def forward(self, states, mask=None):
             hidden = self.body(states)
             return self.actor(hidden), self.critic(hidden).squeeze(-1)
 
@@ -223,7 +223,7 @@ class FiniteScenarioRobustPPO:
             mask = torch.tensor(context.action_mask, dtype=torch.bool,
                                 device=self.device).unsqueeze(0)
             with torch.no_grad():
-                logits, _ = self.model(state)
+                logits, _ = self.model(state, mask)
                 action = int(logits.masked_fill(~mask, -1.0e9)
                              .argmax(dim=-1).item())
             _, reward, terminated, truncated, _ = env.step(action)
@@ -254,7 +254,7 @@ class FiniteScenarioRobustPPO:
             mask_tensor = torch.tensor(mask_tuple, dtype=torch.bool,
                                        device=self.device).unsqueeze(0)
             with torch.no_grad():
-                logits, value = self.model(state_tensor)
+                logits, value = self.model(state_tensor, mask_tensor)
                 logits = logits.masked_fill(~mask_tensor, -1.0e9)
                 distribution = torch.distributions.Categorical(logits=logits)
                 action = distribution.sample()
@@ -336,7 +336,7 @@ class FiniteScenarioRobustPPO:
             permutation = torch.randperm(count, device=self.device)
             for start in range(0, count, cfg.minibatch_size):
                 indices = permutation[start:start + cfg.minibatch_size]
-                logits, predicted_values = self.model(states[indices])
+                logits, predicted_values = self.model(states[indices], masks[indices])
                 masked_logits = logits.masked_fill(~masks[indices], -1.0e9)
                 distribution = torch.distributions.Categorical(logits=masked_logits)
                 new_log_probs = distribution.log_prob(actions[indices])
@@ -351,6 +351,8 @@ class FiniteScenarioRobustPPO:
                 )
                 loss = (policy_loss + cfg.value_coefficient * value_loss
                         - cfg.entropy_coefficient * entropy)
+                if hasattr(self, "_auxiliary_loss"):
+                    loss = loss + self._auxiliary_loss(states[indices], masks[indices])
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(),

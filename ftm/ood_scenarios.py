@@ -16,7 +16,7 @@ from .surrogate import PARAMETER_NAMES, scenario_to_raw
 
 
 OOD_FAMILIES = ("normal", "failure", "network", "load", "mixed")
-OOD_SEVERITIES = ("base", "l1", "l2")
+OOD_SEVERITIES = ("base", "l1", "l2", "l3")
 
 
 def scenario_family(scenario_name: str) -> str:
@@ -40,19 +40,27 @@ def make_test_scenario(scenario_name: str, severity: str,
     if family == "normal":
         changes = ({"failure_multiplier": 0.4, "congestion_enter": 0.02}
                    if severity == "l1" else
-                   {"failure_multiplier": 0.6, "congestion_enter": 0.04})
+                   {"failure_multiplier": 0.6, "congestion_enter": 0.04}
+                   if severity == "l2" else
+                   {"failure_multiplier": 0.8, "congestion_enter": 0.06})
     elif family == "failure":
         changes = ({"failure_multiplier": 12.0, "common_shock_probability": 0.003}
                    if severity == "l1" else
-                   {"failure_multiplier": 16.0, "common_shock_probability": 0.005})
+                   {"failure_multiplier": 16.0, "common_shock_probability": 0.005}
+                   if severity == "l2" else
+                   {"failure_multiplier": 20.0, "common_shock_probability": 0.008})
     elif family == "network":
         changes = ({"congestion_enter": 0.50, "congestion_leave": 0.08}
                    if severity == "l1" else
-                   {"congestion_enter": 0.65, "congestion_leave": 0.05})
+                   {"congestion_enter": 0.65, "congestion_leave": 0.05}
+                   if severity == "l2" else
+                   {"congestion_enter": 0.80, "congestion_leave": 0.03})
     elif family == "load":
         changes = ({"load_burst_probability": 0.22, "load_burst_cpu": 0.65}
                    if severity == "l1" else
-                   {"load_burst_probability": 0.30, "load_burst_cpu": 0.75})
+                   {"load_burst_probability": 0.30, "load_burst_cpu": 0.75}
+                   if severity == "l2" else
+                   {"load_burst_probability": 0.40, "load_burst_cpu": 0.85})
     else:
         changes = ({
             "failure_multiplier": 5.0,
@@ -68,6 +76,13 @@ def make_test_scenario(scenario_name: str, severity: str,
             "common_shock_probability": 0.005,
             "load_burst_probability": 0.15,
             "load_burst_cpu": 0.75,
+        } if severity == "l2" else {
+            "failure_multiplier": 9.0,
+            "congestion_enter": 0.45,
+            "congestion_leave": 0.05,
+            "common_shock_probability": 0.008,
+            "load_burst_probability": 0.20,
+            "load_burst_cpu": 0.85,
         })
     return replace(base, name=f"{family}__ood_{severity}", **changes)
 

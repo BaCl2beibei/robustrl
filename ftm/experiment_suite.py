@@ -48,17 +48,17 @@ def build_evaluation_cases(split: str, severity: str, scenario_name: str,
     """Build uniquely named ID/OOD cases while leaving training presets untouched."""
     if split not in ("id", "ood", "all"):
         raise ValueError("split must be id, ood, or all")
-    if severity not in ("base", "l1", "l2", "all"):
-        raise ValueError("severity must be base, l1, l2, or all")
+    if severity not in ("base", "l1", "l2", "l3", "all"):
+        raise ValueError("severity must be base, l1, l2, l3, or all")
     if scenario_name != "all" and scenario_name not in SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario_name}")
 
     include_id = split in ("id", "all") and severity in ("base", "all")
-    include_ood = split in ("ood", "all") and severity in ("l1", "l2", "all")
-    if split == "id" and severity in ("l1", "l2"):
+    include_ood = split in ("ood", "all") and severity in ("l1", "l2", "l3", "all")
+    if split == "id" and severity in ("l1", "l2", "l3"):
         raise ValueError("ID split only supports severity=base or all")
     if split == "ood" and severity == "base":
-        raise ValueError("OOD split requires severity=l1, l2, or all")
+        raise ValueError("OOD split requires severity=l1, l2, l3, or all")
 
     selected_names = SCENARIOS if scenario_name == "all" else (scenario_name,)
     cases: list[EvaluationCase] = []
@@ -74,6 +74,7 @@ def build_evaluation_cases(split: str, severity: str, scenario_name: str,
             if family not in OOD_FAMILIES:
                 raise ValueError(f"OOD evaluation is unavailable for {scenario_name}")
             families = (family,)
+        # Keep the existing 'all' suite stable; L3 is an explicit held-out test.
         severities = (("l1", "l2") if severity == "all" else (severity,))
         for family in families:
             for level in severities:
@@ -273,7 +274,7 @@ def main() -> None:
     parser.add_argument("--scenario", choices=("all",) + SCENARIOS, default="all")
     parser.add_argument("--split", choices=("id", "ood", "all"), default="id",
                         help="evaluate base ID conditions, stronger OOD conditions, or both")
-    parser.add_argument("--severity", choices=("base", "l1", "l2", "all"),
+    parser.add_argument("--severity", choices=("base", "l1", "l2", "l3", "all"),
                         default="base", help="severity level for the requested split")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--output", type=Path, default=Path("runs/research"))

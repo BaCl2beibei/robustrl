@@ -18,9 +18,11 @@ import torch
 
 from run_ood_pgd_experiment import (
     SCENARIOS, balanced_schedule, build_surrogate, collect_and_update,
-    evaluate, flush, make_trainer, save_checkpoint, search_block, validate,
+    evaluate, flush, make_trainer, save_checkpoint, search_block,
+    set_auxiliary_beta, validate,
     write_csv,
 )
+from run_ppo_abc import pretrain_gate
 from ftm.config import SimulationConfig
 from ftm.observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION
 from ftm.robust_ppo import PPOConfig
@@ -54,8 +56,12 @@ def prepare(args, config):
         for i, scenario in enumerate(schedule)])
 
     trainer = make_trainer(config, ppo, args.seed * 1_000_000 + 1, args.device)
+    pretrain_info = pretrain_gate(trainer, config, args.seed, args.pretrain_episodes)
+    (root / "gate_pretraining.json").write_text(
+        json.dumps(pretrain_info, indent=2), encoding="utf-8")
     buffer, training = [], []
     for i in range(args.warmup):
+        set_auxiliary_beta(trainer, i + 1, args)
         result = collect_and_update(trainer, schedule[i], env_seeds[i], i + 1,
                                     buffer, args.rollout_steps)
         training.append(asdict(result) | {"method": "warmup", "adversarial": False})
@@ -70,7 +76,7 @@ def prepare(args, config):
     print(f"WARMUP_COMPLETE seed={args.seed} score={score:.6f}", flush=True)
 
     surrogate, records = build_surrogate(
-        root, config, args, trainer.model.body[0].in_features)
+        root, config, args, trainer.model.gate[0].in_features)
     with (root / "surrogate.pt").open("xb") as stream:
         torch.save(surrogate.state_dict(), stream)
     (root / "PREPARE_COMPLETE.txt").write_text(
@@ -88,6 +94,8 @@ def branch(args, config):
     method_dir.mkdir(exist_ok=False)
     warmup = torch.load(root / "warmup.pt", map_location="cpu",
                         weights_only=False)
+    if warmup.get("model_type") != "c_hierarchical_aux":
+        raise ValueError("shared warmup must use the C hierarchical PPO model")
     ppo = PPOConfig(**warmup["ppo_config"])
     trainer = make_trainer(config, ppo, args.seed * 1_000_000 + 2, args.device)
     trainer.model.load_state_dict(warmup["model_state_dict"])
@@ -101,7 +109,7 @@ def branch(args, config):
     surrogate, records = None, None
     if method == "pgd_ppo":
         surrogate = build_transition_surrogate(
-            trainer.model.body[0].in_features, config.n_nodes + 1).to(args.device)
+            trainer.model.gate[0].in_features, config.n_nodes + 1).to(args.device)
         surrogate.load_state_dict(torch.load(root / "surrogate.pt",
                                              map_location="cpu", weights_only=True))
         surrogate.eval()
@@ -109,6 +117,7 @@ def branch(args, config):
                    .read_text(encoding="utf-8").splitlines()]
     block_choices = None
     for i in range(args.warmup, args.episodes):
+        set_auxiliary_beta(trainer, i + 1, args)
         block = (i - args.warmup) // args.block_size
         if method == "pgd_ppo" and (i - args.warmup) % args.block_size == 0:
             block_choices, pgd_rows = search_block(trainer, surrogate, records,
@@ -198,6 +207,8 @@ def main():
     parser.add_argument("--id-episodes", type=int, default=50)
     parser.add_argument("--ood-episodes", type=int, default=100)
     parser.add_argument("--surrogate-episodes", type=int, default=10)
+    parser.add_argument("--pretrain-episodes", type=int, default=50)
+    parser.add_argument("--aux-beta", type=float, default=0.1)
     parser.add_argument("--surrogate-epochs", type=int, default=20)
     parser.add_argument("--pgd-steps", type=int, default=4)
     parser.add_argument("--pgd-rate", type=float, default=0.05)
@@ -210,7 +221,8 @@ def main():
     if (args.seed < 1 or args.episodes <= args.warmup or args.warmup < 1
             or args.episodes % 5 or args.warmup % 5
             or (args.episodes - args.warmup) % args.block_size
-            or args.block_size % 5 or args.validation_interval < 1):
+            or args.block_size % 5 or args.validation_interval < 1
+            or args.pretrain_episodes < 1 or args.aux_beta < 0):
         parser.error("invalid episode schedule")
     if args.device == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA is unavailable")

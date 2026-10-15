@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 
 
-SCHEMA_VERSION = "decision-context-v1"
+SCHEMA_VERSION = "decision-context-v3-recovery-aux8"
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class PublicConfig:
     congested_delay_mean_seconds: float
     congested_delay_std_seconds: float
     link_bandwidth_bytes_per_second: float
+    dt_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class DecisionContext:
 
 FEATURE_ORDER = (
     "time_seconds", "focus_task_id", "public_config", "nodes", "tasks",
-    "links", "action_mask",
+    "links", "action_mask", "candidate_node_aux8",
 )
 FEATURE_SCALES = {
     "time_seconds": 100.0, "max_time_seconds": 100.0,
@@ -134,4 +135,6 @@ def encode_observation(context: DecisionContext) -> tuple[float, ...]:
         values.extend(_scaled(field.name, getattr(link, field.name))
                       for field in fields(LinkObservation))
     values.extend(float(ok) for ok in context.action_mask)
+    from .decision_features import encode_candidate_features
+    values.extend(encode_candidate_features(context))
     return tuple(values)

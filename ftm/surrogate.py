@@ -16,6 +16,8 @@ from dataclasses import replace
 from typing import Callable, Mapping, Sequence
 
 from .config import ScenarioConfig
+from .decision_features import AUX_FEATURES_PER_NODE
+from .observation import SCHEMA_VERSION
 from .uncertainty import sensitivity_axes, sigmoid, softplus
 
 
@@ -150,11 +152,16 @@ def _infer_state_layout(state_dim: int, action_dim: int) -> tuple[int, int]:
     n_nodes = action_dim - 1
     if n_nodes < 2:
         raise ValueError("action_dim must include at least two nodes and the wait action")
-    current_fixed = 10 + 15 * n_nodes + 5 * n_nodes * n_nodes
+    current_fixed = 11 + 15 * n_nodes + 5 * n_nodes * n_nodes
     current_stride = 21 + 2 * n_nodes
     if (state_dim - current_fixed >= current_stride
             and (state_dim - current_fixed) % current_stride == 0):
         return n_nodes, (state_dim - current_fixed) // current_stride
+    if SCHEMA_VERSION == "decision-context-v3-recovery-aux8":
+        base_dim = state_dim - AUX_FEATURES_PER_NODE * n_nodes
+        if (base_dim - current_fixed >= current_stride
+                and (base_dim - current_fixed) % current_stride == 0):
+            return n_nodes, (base_dim - current_fixed) // current_stride
     # Node features (8 each), directed links (4 each), task state (16 + 2N),
     # global features (3), burst estimates (N), and migration progress (3/task).
     fixed = 4 * n_nodes * n_nodes + 9 * n_nodes + 3
@@ -192,7 +199,23 @@ def project_predicted_next_state(predicted_state, action_dim: int):
     """
     torch = _torch()
     n_nodes, n_tasks = _infer_state_layout(predicted_state.shape[-1], action_dim)
-    if (predicted_state.shape[-1] == 10 + 15 * n_nodes
+    base_dim = (11 + 15 * n_nodes + 5 * n_nodes * n_nodes
+                + n_tasks * (21 + 2 * n_nodes))
+    if (SCHEMA_VERSION == "decision-context-v3-recovery-aux8"
+            and predicted_state.shape[-1] == base_dim + AUX_FEATURES_PER_NODE * n_nodes):
+        base_state = project_predicted_next_state(predicted_state[..., :base_dim],
+                                                  action_dim)
+        raw_aux = predicted_state[..., base_dim:].reshape(
+            *predicted_state.shape[:-1], n_nodes, AUX_FEATURES_PER_NODE)
+        nonnegative = raw_aux.clamp_min(0.0)
+        feasible_aux = torch.cat((nonnegative[..., :3], raw_aux[..., 3:4],
+                                  nonnegative[..., 4:7],
+                                  raw_aux[..., 7:8].clamp(0.0, 1.0)), dim=-1)
+        feasible_aux = raw_aux + (feasible_aux - raw_aux).detach()
+        target_mask = base_state[..., base_dim - action_dim:base_dim - 1]
+        feasible_aux = feasible_aux * target_mask.unsqueeze(-1)
+        return torch.cat((base_state, feasible_aux.flatten(start_dim=-2)), dim=-1)
+    if (predicted_state.shape[-1] == 11 + 15 * n_nodes
             + 5 * n_nodes * n_nodes + n_tasks * (21 + 2 * n_nodes)):
         # Current schema has unbounded measured quantities. Only enforce
         # non-negativity and categorical fields; never clip large bursts.
@@ -200,7 +223,7 @@ def project_predicted_next_state(predicted_state, action_dim: int):
                                        - predicted_state).detach()
         projected = projected.clone()
         groups = [(1, n_tasks + 1)]
-        node_start = 9 + n_tasks
+        node_start = 10 + n_tasks
         task_start = node_start + 14 * n_nodes
         for task in range(n_tasks):
             start = task_start + task * (20 + 2 * n_nodes)

@@ -103,6 +103,7 @@ class SimulationConfig:
     task_memory_max: float = 12.0
     task_deadline_multiplier: float = 1.8
     delay_cost_weight: float = 0.5
+    overdue_cost_weight: float = 0.5
     service_loss_cost_weight: float = 1.0
     progress_reward_weight: float = 0.25
     monitoring: MonitoringConfig = MonitoringConfig()
@@ -126,6 +127,8 @@ class SimulationConfig:
             raise ValueError("invalid task work interval")
         if self.delay_cost_weight < 0:
             raise ValueError("delay_cost_weight must be non-negative")
+        if self.overdue_cost_weight < 0:
+            raise ValueError("overdue_cost_weight must be non-negative")
         if self.service_loss_cost_weight < 0:
             raise ValueError("service_loss_cost_weight must be non-negative")
         if self.progress_reward_weight < 0:

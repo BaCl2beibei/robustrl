@@ -57,6 +57,24 @@ class OODScenarioTests(unittest.TestCase):
         self.assertEqual(make_test_scenario("load_short", "base", self.config).name,
                          "load_short")
 
+    def test_explicit_l3_cases_extend_l2_without_changing_legacy_all_suite(self):
+        l3_cases = build_evaluation_cases("ood", "l3", "all", self.config)
+        self.assertEqual(len(l3_cases), 5)
+        self.assertEqual({case.scenario_id for case in l3_cases},
+                         {f"{family}__ood_l3" for family in OOD_FAMILIES})
+        self.assertEqual(len(build_evaluation_cases(
+            "ood", "all", "all", self.config)), 10)
+        for case in l3_cases:
+            l2 = make_test_scenario(case.scenario_family, "l2", self.config)
+            l3 = case.scenario
+            if case.scenario_family in ("normal", "failure", "mixed"):
+                self.assertGreater(l3.failure_multiplier, l2.failure_multiplier)
+            if case.scenario_family in ("normal", "network", "mixed"):
+                self.assertGreater(l3.congestion_enter, l2.congestion_enter)
+            if case.scenario_family in ("load", "mixed"):
+                self.assertGreater(l3.load_burst_probability,
+                                   l2.load_burst_probability)
+
     def test_training_noise_bounds_are_centered_on_each_base_scenario(self):
         base = scenario_by_name("mixed", self.config)
         lower, upper = training_raw_bounds(base, noise_std=0.25)

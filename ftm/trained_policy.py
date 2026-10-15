@@ -7,6 +7,7 @@ from .config import ScenarioConfig, SimulationConfig
 from .observation import (DecisionContext, FEATURE_ORDER, FEATURE_SCALES,
                           SCHEMA_VERSION, encode_observation)
 from .robust_ppo import _build_actor_critic
+from .hierarchical_ppo import build_hierarchical_actor_critic
 
 
 def _torch():
@@ -51,7 +52,13 @@ class TrainedPolicy:
                 or (saved_action_dim is not None and saved_action_dim != action_dim)):
             raise ValueError("checkpoint dimensions do not match the requested environment")
         self._is_adversarial = "surrogate_state_dict" in checkpoint
-        self.model = _build_actor_critic(state_dim, action_dim).to(self.device)
+        model_type = checkpoint.get("model_type", "flat_ppo")
+        if model_type == "c_hierarchical_aux":
+            self.model = build_hierarchical_actor_critic(state_dim, action_dim).to(self.device)
+        elif model_type == "flat_ppo":
+            self.model = _build_actor_critic(state_dim, action_dim).to(self.device)
+        else:
+            raise ValueError(f"unsupported PPO model type: {model_type}")
         self.model.load_state_dict(checkpoint[policy_key])
         self.model.eval()
         del checkpoint
@@ -67,10 +74,9 @@ class TrainedPolicy:
         mask = torch.tensor(context.action_mask, dtype=torch.bool,
                             device=self.device).unsqueeze(0)
         with torch.no_grad():
-            logits, _ = self.model(state)
+            logits, _ = self.model(state, mask)
             masked_logits = logits.masked_fill(~mask, -1.0e9)
-            distribution = torch.distributions.Categorical(logits=masked_logits)
-            action = int(distribution.sample().item())
+            action = int(masked_logits.argmax(dim=-1).item())
         return action
 
 

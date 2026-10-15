@@ -1,27 +1,35 @@
 param(
     [string]$Python = 'D:\Anaconda_envs\envs\migrationproject\python.exe',
-    [string]$RunName = 'ood_pgd_20261012',
-    [int]$PilotPid = 43484
+    [string]$RunName = 'ood_pgd_short_20261013'
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $entry = Join-Path $PSScriptRoot 'run_ood_pgd_parallel_worker.py'
 $root = Join-Path $repo (Join-Path 'runs' $RunName)
-$log = Join-Path $root 'six_parallel_queue.log'
-$pilotMarker = Join-Path $root 'pilot_seed1\TRAINING_COMPLETE.txt'
+
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw "Anaconda Python not found: $Python"
+}
+if (Test-Path -LiteralPath $root) {
+    throw "Output already exists: $root"
+}
+& $Python -c 'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"'
+if ($LASTEXITCODE -ne 0) {
+    throw 'CUDA preflight failed'
+}
+New-Item -ItemType Directory -Path $root | Out-Null
+$log = Join-Path $root 'parallel_queue.log'
 
 function Start-Worker([int]$Seed, [string]$Phase, [string]$Method) {
     $label = if ($Method) { "seed${Seed}_${Method}" } else { "seed${Seed}_${Phase}" }
     $output = Join-Path $root "main_seed$Seed"
-    if ($Phase -eq 'prepare' -and (Test-Path -LiteralPath $output)) {
-        throw "Output already exists: $output"
-    }
     $stdout = Join-Path $root "$label.stdout.log"
     $stderr = Join-Path $root "$label.stderr.log"
     $arguments = @('-u', $entry, '--output-dir', $output, '--phase', $Phase,
-                   '--seed', "$Seed", '--episodes', '20000',
-                   '--warmup', '2000', '--device', 'cuda')
+                   '--seed', "$Seed", '--episodes', '4000', '--warmup', '400',
+                   '--block-size', '60', '--validation-interval', '200',
+                   '--device', 'cuda')
     if ($Method) { $arguments += @('--method', $Method) }
     $process = Start-Process -FilePath $Python -ArgumentList $arguments `
         -WorkingDirectory $repo -PassThru -WindowStyle Hidden `
@@ -44,12 +52,12 @@ function Wait-Stage([object[]]$Jobs) {
             foreach ($job in @($pending)) {
                 $job.Process.Refresh()
                 if (-not $job.Process.HasExited) { continue }
-                if (-not (Test-Path -LiteralPath $job.Marker)) {
+                if (-not (Test-Path -LiteralPath $job.Marker -PathType Leaf)) {
                     "FAILED label=$($job.Label) launcher_exit=$($job.Process.ExitCode) missing_final_marker" |
                         Add-Content -LiteralPath $log
                     throw "Worker failed: $($job.Label). See $($job.Stderr)"
                 }
-                if ($job.Process.ExitCode -ne 0) {
+                if ($null -ne $job.Process.ExitCode -and $job.Process.ExitCode -ne 0) {
                     "WARNING label=$($job.Label) launcher_exit=$($job.Process.ExitCode) final_marker_present" |
                         Add-Content -LiteralPath $log
                 }
@@ -73,17 +81,8 @@ function Wait-Stage([object[]]$Jobs) {
 }
 
 try {
-    "WAIT_PILOT pid=$PilotPid $(Get-Date -Format o)" | Add-Content -LiteralPath $log
-    while (-not (Test-Path -LiteralPath $pilotMarker)) {
-        if (-not (Get-Process -Id $PilotPid -ErrorAction SilentlyContinue)) {
-            throw 'Pilot ended without TRAINING_COMPLETE.txt'
-        }
-        Start-Sleep -Seconds 30
-    }
-    'PILOT_COMPLETE' | Add-Content -LiteralPath $log
     $preparations = @(foreach ($seed in 1..3) { Start-Worker $seed 'prepare' '' })
     Wait-Stage $preparations
-    'SIX_BRANCHES_STARTING' | Add-Content -LiteralPath $log
     $branches = @(foreach ($seed in 1..3) {
         foreach ($method in @('ppo', 'pgd_ppo')) {
             Start-Worker $seed 'branch' $method

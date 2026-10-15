@@ -243,7 +243,8 @@ class MigrationEnvironment:
             self.config.restore_delay_seconds,
             self.config.congested_delay_mean_seconds,
             self.config.congested_delay_std_seconds,
-            self.config.link_bandwidth_bytes_per_second)
+            self.config.link_bandwidth_bytes_per_second,
+            self.config.dt_seconds)
         self._monitor_history.append(DecisionContext(
             self.time_seconds, None, tuple(nodes), tasks, links, (), public))
         self._last_monitor_time = self.time_seconds
@@ -289,10 +290,11 @@ class MigrationEnvironment:
                 break
             dt_seconds = min(self.config.dt_seconds,
                              self.config.max_time_seconds - self.time_seconds)
-            unfinished_before = sum(
-                task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-                for task in self.cluster.tasks.values()
-            )
+            unfinished_before = [
+                task for task in self.cluster.tasks.values()
+                if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            ]
+            step_start = self.time_seconds
             service_loss_before = self._service_loss_ratio()
             work_before = {task.task_id: task.remaining_work
                            for task in self.cluster.tasks.values()}
@@ -310,8 +312,17 @@ class MigrationEnvironment:
             for event in tick_events + migration_events + schedule_events:
                 reward += self._event_reward(event)
             reward -= self._resource_overload_cost() * dt_seconds
-            reward -= (self.config.delay_cost_weight * dt_seconds
-                       / self.config.max_time_seconds * unfinished_before)
+            for unfinished_task in unfinished_before:
+                deadline_length = max(
+                    1e-9, unfinished_task.deadline_seconds - unfinished_task.arrival_time)
+                active_seconds = max(
+                    0.0, self.time_seconds - max(step_start, unfinished_task.arrival_time))
+                overdue_seconds = max(
+                    0.0, self.time_seconds - max(
+                        step_start, unfinished_task.arrival_time,
+                        unfinished_task.deadline_seconds))
+                reward -= self.config.delay_cost_weight * active_seconds / deadline_length
+                reward -= self.config.overdue_cost_weight * overdue_seconds / deadline_length
             service_loss_after = self._service_loss_ratio()
             reward -= (self.config.service_loss_cost_weight
                        * 0.5 * (service_loss_before + service_loss_after)
@@ -389,8 +400,6 @@ class MigrationEnvironment:
             return -1.0
         if event.kind == "horizon_incomplete":
             return -1.0
-        if event.kind == "sla_violated":
-            return -0.5
         if event.kind == "migration_aborted":
             return -0.02
         if event.kind == "migration_confirmed":

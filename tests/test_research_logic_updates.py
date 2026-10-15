@@ -127,7 +127,7 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         env = MigrationEnvironment(config, ScenarioConfig(name="quiet"))
         observation, _ = env.reset(seed=23)
         n_nodes = config.n_nodes
-        task_offset = 9 + config.n_tasks + 14 * n_nodes
+        task_offset = 10 + config.n_tasks + 14 * n_nodes
         status_start = task_offset + 10
         predicted = torch.tensor(observation, dtype=torch.float32).clone()
         predicted[4] = 2.5  # unbounded measured values are retained
@@ -142,7 +142,7 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         status = projected[0, status_start:status_start + 6]
         self.assertAlmostEqual(float(status.sum()), 1.0)
         self.assertTrue(torch.all((status == 0.0) | (status == 1.0)).item())
-        self.assertTrue(torch.all(projected >= 0.0).item())
+        self.assertTrue(torch.all(projected[..., :-8 * n_nodes] >= 0.0).item())
         self.assertAlmostEqual(float(projected[0, 4]), 2.5)
         self.assertAlmostEqual(float(projected[0, 0]), 0.0)
 
@@ -183,6 +183,35 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         horizon = MigrationEnvironment._event_reward(Event(1.0, "horizon_incomplete", 0))
         self.assertEqual(task_failure, horizon)
         self.assertEqual(task_failure, -1.0)
+        self.assertEqual(MigrationEnvironment._event_reward(
+            Event(1.0, "sla_violated", 0)), 0.0)
+
+    def test_time_cost_uses_task_deadline_and_overdue_duration(self):
+        config = SimulationConfig(
+            n_nodes=2, n_tasks=1, k_required=1, max_time_seconds=3.0,
+            base_failure_rate=0.0, base_repair_rate=0.0,
+            task_work_min=100.0, task_work_max=100.0,
+            progress_reward_weight=0.0, service_loss_cost_weight=0.0,
+        )
+        quiet = ScenarioConfig(name="quiet", failure_multiplier=0.0,
+                               congestion_enter=0.0, load_burst_probability=0.0)
+        env = MigrationEnvironment(config, quiet)
+        env.reset(seed=41)
+        task = next(iter(env.cluster.tasks.values()))
+        task.deadline_seconds = 0.5
+
+        _, first_reward, _, _, first_info = env.step(config.n_nodes)
+        _, second_reward, _, _, _ = env.step(config.n_nodes)
+        self.assertAlmostEqual(first_reward, -1.5)
+        self.assertAlmostEqual(second_reward, -2.0)
+        self.assertTrue(any(event["kind"] == "sla_violated"
+                            for event in first_info["events"]))
+
+        later_env = MigrationEnvironment(config, quiet)
+        later_env.reset(seed=41)
+        next(iter(later_env.cluster.tasks.values())).deadline_seconds = 2.0
+        _, later_reward, _, _, _ = later_env.step(config.n_nodes)
+        self.assertAlmostEqual(later_reward, -0.25)
 
     def test_reward_includes_dense_service_loss_and_progress(self):
         interrupted_config = SimulationConfig(
@@ -199,7 +228,8 @@ class ResearchLogicUpdateTests(unittest.TestCase):
         interrupted_env.cluster.nodes[task.node_id].up = False
         task.status = TaskStatus.INTERRUPTED
         _, reward, _, _, _ = interrupted_env.step(interrupted_config.n_nodes)
-        self.assertAlmostEqual(reward, -0.15)
+        self.assertAlmostEqual(
+            reward, -0.1 - interrupted_config.delay_cost_weight / task.deadline_seconds)
         task.status = TaskStatus.MIGRATING
         self.assertEqual(interrupted_env._service_loss_ratio(), 0.0)
 

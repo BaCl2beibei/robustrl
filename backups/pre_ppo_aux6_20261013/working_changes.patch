@@ -1,0 +1,1010 @@
+﻿diff --git a/ftm/config.py b/ftm/config.py
+index c46bb63..8b97c6c 100644
+--- a/ftm/config.py
++++ b/ftm/config.py
+@@ -103,6 +103,7 @@ class SimulationConfig:
+     task_memory_max: float = 12.0
+     task_deadline_multiplier: float = 1.8
+     delay_cost_weight: float = 0.5
++    overdue_cost_weight: float = 0.5
+     service_loss_cost_weight: float = 1.0
+     progress_reward_weight: float = 0.25
+     monitoring: MonitoringConfig = MonitoringConfig()
+@@ -126,6 +127,8 @@ class SimulationConfig:
+             raise ValueError("invalid task work interval")
+         if self.delay_cost_weight < 0:
+             raise ValueError("delay_cost_weight must be non-negative")
++        if self.overdue_cost_weight < 0:
++            raise ValueError("overdue_cost_weight must be non-negative")
+         if self.service_loss_cost_weight < 0:
+             raise ValueError("service_loss_cost_weight must be non-negative")
+         if self.progress_reward_weight < 0:
+diff --git a/ftm/environment.py b/ftm/environment.py
+index 0e8b11f..00cfae9 100644
+--- a/ftm/environment.py
++++ b/ftm/environment.py
+@@ -289,10 +289,11 @@ class MigrationEnvironment:
+                 break
+             dt_seconds = min(self.config.dt_seconds,
+                              self.config.max_time_seconds - self.time_seconds)
+-            unfinished_before = sum(
+-                task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+-                for task in self.cluster.tasks.values()
+-            )
++            unfinished_before = [
++                task for task in self.cluster.tasks.values()
++                if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
++            ]
++            step_start = self.time_seconds
+             service_loss_before = self._service_loss_ratio()
+             work_before = {task.task_id: task.remaining_work
+                            for task in self.cluster.tasks.values()}
+@@ -310,8 +311,17 @@ class MigrationEnvironment:
+             for event in tick_events + migration_events + schedule_events:
+                 reward += self._event_reward(event)
+             reward -= self._resource_overload_cost() * dt_seconds
+-            reward -= (self.config.delay_cost_weight * dt_seconds
+-                       / self.config.max_time_seconds * unfinished_before)
++            for unfinished_task in unfinished_before:
++                deadline_length = max(
++                    1e-9, unfinished_task.deadline_seconds - unfinished_task.arrival_time)
++                active_seconds = max(
++                    0.0, self.time_seconds - max(step_start, unfinished_task.arrival_time))
++                overdue_seconds = max(
++                    0.0, self.time_seconds - max(
++                        step_start, unfinished_task.arrival_time,
++                        unfinished_task.deadline_seconds))
++                reward -= self.config.delay_cost_weight * active_seconds / deadline_length
++                reward -= self.config.overdue_cost_weight * overdue_seconds / deadline_length
+             service_loss_after = self._service_loss_ratio()
+             reward -= (self.config.service_loss_cost_weight
+                        * 0.5 * (service_loss_before + service_loss_after)
+@@ -389,8 +399,6 @@ class MigrationEnvironment:
+             return -1.0
+         if event.kind == "horizon_incomplete":
+             return -1.0
+-        if event.kind == "sla_violated":
+-            return -0.5
+         if event.kind == "migration_aborted":
+             return -0.02
+         if event.kind == "migration_confirmed":
+diff --git a/ftm/trained_policy.py b/ftm/trained_policy.py
+index 5e9bd6e..ed89b6a 100644
+--- a/ftm/trained_policy.py
++++ b/ftm/trained_policy.py
+@@ -69,8 +69,7 @@ class TrainedPolicy:
+         with torch.no_grad():
+             logits, _ = self.model(state)
+             masked_logits = logits.masked_fill(~mask, -1.0e9)
+-            distribution = torch.distributions.Categorical(logits=masked_logits)
+-            action = int(distribution.sample().item())
++            action = int(masked_logits.argmax(dim=-1).item())
+         return action
+ 
+ 
+diff --git a/scripts/plot_ood_pgd_results.py b/scripts/plot_ood_pgd_results.py
+deleted file mode 100644
+index 2e34482..0000000
+--- a/scripts/plot_ood_pgd_results.py
++++ /dev/null
+@@ -1,285 +0,0 @@
+-"""Plot the completed three-seed PPO/PGD-PPO experiment.
+-
+-Usage: python scripts/plot_ood_pgd_results.py --run-dir runs/ood_pgd_20261012
+-Outputs are written directly to the run directory. Existing outputs are kept.
+-"""
+-
+-from __future__ import annotations
+-
+-import argparse
+-import json
+-from pathlib import Path
+-
+-import matplotlib
+-
+-matplotlib.use("Agg")
+-import matplotlib.pyplot as plt
+-import numpy as np
+-import pandas as pd
+-
+-
+-FAMILIES = ("normal", "failure", "network", "load", "mixed")
+-LEVELS = ("l1", "l2")
+-POLICIES = ("no_migration", "time_min", "ppo", "pgd_ppo")
+-LABELS = {"no_migration": "No-Migration", "time_min": "Time-Min",
+-          "ppo": "PPO", "pgd_ppo": "PGD-PPO"}
+-COLORS = {"no_migration": "#707988", "time_min": "#e68624",
+-          "ppo": "#2369a8", "pgd_ppo": "#7d4bb0"}
+-MARKERS = {"no_migration": "o", "time_min": "s", "ppo": "^", "pgd_ppo": "D"}
+-METRICS = (
+-    ("task_completion_rate", "Task completion", "%", True),
+-    ("task_service_availability", "Task service availability", "%", True),
+-    ("sla_violation_rate", "SLA violation", "%", True),
+-    ("mean_completion_seconds_horizon_capped", "Completion time (horizon capped)", "s", False),
+-    ("migration_count", "Migrations per episode", "count", False),
+-    ("total_reward", "Total reward", "reward", False),
+-)
+-
+-
+-def load_data(root: Path):
+-    if "QUEUE_COMPLETE" not in (root / "six_parallel_queue.log").read_text(
+-            encoding="utf-8"):
+-        raise RuntimeError("six-process experiment is not complete")
+-    tests, training, validation, selections = [], [], [], {}
+-    for seed in (1, 2, 3):
+-        run = root / f"main_seed{seed}"
+-        for marker in ("TRAINING_COMPLETE.txt", "TEST_COMPLETE.txt"):
+-            if not (run / marker).is_file():
+-                raise RuntimeError(f"missing {run / marker}")
+-        tests.append(pd.read_csv(run / "test" / "episodes.csv").assign(train_seed=seed))
+-        training.append(pd.read_csv(run / "training.csv").assign(train_seed=seed))
+-        validation.append(pd.read_csv(run / "validation.csv").assign(train_seed=seed))
+-        for method in ("ppo", "pgd_ppo"):
+-            selections[seed, method] = json.loads(
+-                (run / method / "selected.json").read_text(encoding="utf-8"))
+-    test = pd.concat(tests, ignore_index=True)
+-    train = pd.concat(training, ignore_index=True)
+-    valid = pd.concat(validation, ignore_index=True)
+-    ood = test[test["split"] == "ood"].copy()
+-    expected = {(f"{family}__ood_{level}", policy, seed)
+-                for family in FAMILIES for level in LEVELS
+-                for policy in POLICIES for seed in (1, 2, 3)}
+-    counts = ood.groupby(["scenario_id", "policy", "train_seed"]).size().to_dict()
+-    if set(counts) != expected or any(count != 100 for count in counts.values()):
+-        raise RuntimeError("expected exactly 100 OOD episodes for every condition/policy/seed")
+-    if len(ood) != 12_000:
+-        raise RuntimeError(f"expected 12000 OOD rows; got {len(ood)}")
+-    for field, _, _, _ in METRICS:
+-        if ood[field].isna().any():
+-            raise RuntimeError(f"missing OOD values for {field}")
+-    return ood, train, valid, selections
+-
+-
+-def summarize_ood(ood: pd.DataFrame) -> pd.DataFrame:
+-    fields = [metric[0] for metric in METRICS]
+-    by_seed = (ood.groupby(["scenario_id", "scenario_family", "severity",
+-                            "policy", "train_seed"], as_index=False)[fields].mean())
+-    rows = []
+-    for key, group in by_seed.groupby(["scenario_id", "scenario_family",
+-                                       "severity", "policy"], sort=False):
+-        row = dict(zip(("scenario_id", "scenario_family", "severity", "policy"), key))
+-        row.update(n_seeds=3, episodes_per_seed=100)
+-        for field in fields:
+-            row[f"{field}_mean"] = group[field].mean()
+-            row[f"{field}_seed_sd"] = group[field].std(ddof=1)
+-        rows.append(row)
+-    result = pd.DataFrame(rows)
+-    if len(result) != 40:
+-        raise RuntimeError("expected 40 OOD condition/policy summaries")
+-    return result
+-
+-
+-def save_figure(fig, root: Path, stem: str):
+-    for suffix in ("png", "svg"):
+-        path = root / f"{stem}.{suffix}"
+-        if path.exists():
+-            raise FileExistsError(f"figure already exists: {path}")
+-        fig.savefig(path, dpi=180, bbox_inches="tight",
+-                    facecolor="white")
+-        print(path)
+-    plt.close(fig)
+-
+-
+-def ood_overview(root: Path, summary: pd.DataFrame):
+-    fig, axes = plt.subplots(3, 2, figsize=(19, 13.5), layout="constrained")
+-    positions = {(family, level): index * 2.65 + level_index * 0.9
+-                 for index, family in enumerate(FAMILIES)
+-                 for level_index, level in enumerate(LEVELS)}
+-    ticks = [positions[family, level] for family in FAMILIES for level in LEVELS]
+-    tick_labels = [f"{family.title()}\n{level.upper()}"
+-                   for family in FAMILIES for level in LEVELS]
+-    offsets = dict(zip(POLICIES, (-0.24, -0.08, 0.08, 0.24)))
+-    for ax, (field, title, unit, percent) in zip(axes.flat, METRICS):
+-        plotted = []
+-        for policy in POLICIES:
+-            points = []
+-            for family in FAMILIES:
+-                for level in LEVELS:
+-                    scenario_id = f"{family}__ood_{level}"
+-                    row = summary[(summary["scenario_id"] == scenario_id)
+-                                  & (summary["policy"] == policy)].iloc[0]
+-                    scale = 100 if percent else 1
+-                    x = positions[family, level] + offsets[policy]
+-                    y = row[f"{field}_mean"] * scale
+-                    sd = row[f"{field}_seed_sd"] * scale
+-                    points.append((x, y, sd))
+-                    ax.errorbar(x, y, yerr=sd, color=COLORS[policy],
+-                                marker=MARKERS[policy], markersize=5.5,
+-                                capsize=2.3, elinewidth=1.1, linestyle="none",
+-                                markeredgecolor="white", markeredgewidth=0.4)
+-            plotted.extend(points)
+-        for index in range(4):
+-            ax.axvline((ticks[index * 2 + 1] + ticks[index * 2 + 2]) / 2,
+-                       color="#dce2e8", linewidth=1)
+-        ax.set_xticks(ticks, tick_labels, fontsize=8.5)
+-        ax.set_xlim(min(ticks) - 0.65, max(ticks) + 0.65)
+-        ax.set_title(title, loc="left", fontsize=12, fontweight="bold")
+-        ax.set_ylabel(unit)
+-        ax.grid(axis="y", color="#e8ebef", linewidth=0.8)
+-        ax.set_axisbelow(True)
+-        low = min(y - sd for _, y, sd in plotted)
+-        high = max(y + sd for _, y, sd in plotted)
+-        padding = max(0.02 * max(1, abs(high)), 0.08 * (high - low))
+-        if percent:
+-            ax.set_ylim(max(0, low - padding), min(100, high + padding))
+-        else:
+-            ax.set_ylim(low - padding, high + padding)
+-    handles = [plt.Line2D([], [], color=COLORS[p], marker=MARKERS[p],
+-                          linestyle="none", markersize=8, label=LABELS[p])
+-               for p in POLICIES]
+-    fig.legend(handles=handles, loc="outside lower center", ncol=4, frameon=False,
+-               fontsize=11)
+-    fig.suptitle("Four-policy comparison across 10 OOD conditions", fontsize=17,
+-                 fontweight="bold")
+-    fig.text(0.5, 0.025,
+-             "Points: mean; whiskers: SD of three experiment-seed means. "
+-             "Each seed has 100 paired test episodes per condition.",
+-             ha="center", fontsize=9, color="#4b5563")
+-    save_figure(fig, root, "ood_four_policy_comparison")
+-
+-
+-def training_curves(root: Path, train: pd.DataFrame, valid: pd.DataFrame,
+-                    selections: dict):
+-    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True,
+-                             layout="constrained")
+-    window = 500
+-    x = np.arange(100, 20_001, 100)
+-    for method in ("ppo", "pgd_ppo"):
+-        curves = []
+-        for seed in (1, 2, 3):
+-            seed_rows = train[train["train_seed"] == seed]
+-            warmup = seed_rows[seed_rows["method"] == "warmup"]
+-            branch = seed_rows[seed_rows["method"] == method]
+-            joined = pd.concat((warmup, branch)).sort_values("episode")
+-            if len(joined) != 20_000 or not np.array_equal(
+-                    joined["episode"].to_numpy(), np.arange(1, 20_001)):
+-                raise RuntimeError(f"incomplete training episodes: seed={seed} {method}")
+-            rolling = joined["discounted_return"].rolling(
+-                window=window, min_periods=100).mean().to_numpy()
+-            curves.append(rolling[x - 1])
+-        array = np.stack(curves)
+-        mean = array.mean(axis=0)
+-        sd = array.std(axis=0, ddof=1)
+-        axes[0].plot(x, mean, color=COLORS[method], linewidth=2,
+-                     label=LABELS[method])
+-        axes[0].fill_between(x, mean - sd, mean + sd,
+-                             color=COLORS[method], alpha=0.16)
+-    axes[0].axvline(2000, color="#6b7280", linestyle="--", linewidth=1)
+-    axes[0].set_title("Training discounted return (500-episode rolling mean)",
+-                      loc="left", fontweight="bold")
+-    axes[0].set_ylabel("Discounted return")
+-    axes[0].legend(frameon=False, ncol=2)
+-    axes[0].grid(color="#e8ebef", linewidth=0.8)
+-
+-    for method in ("ppo", "pgd_ppo"):
+-        series = []
+-        for seed in (1, 2, 3):
+-            warmup = json.loads((root / f"main_seed{seed}" / "warmup_score.json")
+-                                .read_text(encoding="utf-8"))["score"]
+-            branch = valid[(valid["train_seed"] == seed)
+-                           & (valid["method"] == method)].sort_values("episode")
+-            episodes = np.r_[2000, branch["episode"].to_numpy()]
+-            scores = np.r_[warmup, branch["score"].to_numpy()]
+-            if len(episodes) != 19 or not np.array_equal(
+-                    episodes, np.arange(2000, 20_001, 1000)):
+-                raise RuntimeError(f"incomplete ID validation: seed={seed} {method}")
+-            series.append(scores)
+-            selected_name = Path(selections[seed, method]["checkpoint"].replace("\\", "/"))
+-            selected_episode = 2000 if selected_name.name == "warmup.pt" else int(
+-                selected_name.stem.split("_")[-1])
+-            index = (selected_episode - 2000) // 1000
+-            axes[1].scatter(selected_episode, scores[index], marker="*", s=75,
+-                            color=COLORS[method], edgecolor="white", linewidth=0.5,
+-                            zorder=5)
+-        array = np.stack(series)
+-        mean = array.mean(axis=0)
+-        sd = array.std(axis=0, ddof=1)
+-        xx = np.arange(2000, 20_001, 1000)
+-        axes[1].plot(xx, mean, marker=MARKERS[method], markersize=4.5,
+-                     color=COLORS[method], linewidth=2, label=LABELS[method])
+-        axes[1].fill_between(xx, mean - sd, mean + sd,
+-                             color=COLORS[method], alpha=0.16)
+-    axes[1].set_title("Independent ID validation score (stars: selected checkpoints)",
+-                      loc="left", fontweight="bold")
+-    axes[1].set_xlabel("Training episode")
+-    axes[1].set_ylabel("Composite score")
+-    axes[1].grid(color="#e8ebef", linewidth=0.8)
+-    axes[1].set_xlim(0, 20_000)
+-    axes[1].legend(frameon=False, ncol=2)
+-    fig.suptitle("PPO and PGD-PPO learning curves", fontsize=16,
+-                 fontweight="bold")
+-    fig.text(0.5, 0.015,
+-             "Line: mean over three seeds; band: ±1 seed SD. "
+-             "0–2,000 episodes use the same warmup model for both methods.",
+-             ha="center", fontsize=9, color="#4b5563")
+-    save_figure(fig, root, "training_curves")
+-
+-
+-def write_notes(root: Path, summary: pd.DataFrame):
+-    rates = ("task_completion_rate", "task_service_availability",
+-             "sla_violation_rate")
+-    macro = (summary.groupby("policy")[[f"{name}_mean" for name in rates]]
+-             .mean().reindex(POLICIES) * 100)
+-    lines = ["# OOD 绘图说明", "",
+-             "数据来自 `main_seed1`～`main_seed3/test/episodes.csv`；每种 OOD 条件、每种策略、每个种子有 100 个测试回合。",
+-             "先计算每个种子的均值，再对三个种子取均值；图中的误差线是三个种子均值的标准差，不代表置信区间。",
+-             "同一测试种子用于四种策略的配对比较。训练曲线为 500 回合滚动均值；验证曲线使用独立 ID 种子，星号表示每个种子的入选 checkpoint。",
+-             "", "## 10 种 OOD 条件的宏平均", "",
+-             "| 策略 | 任务完成率 | 服务可用率 | SLA 违约率 |",
+-             "| --- | ---: | ---: | ---: |"]
+-    for policy in POLICIES:
+-        values = macro.loc[policy]
+-        lines.append(f"| {LABELS[policy]} | {values.iloc[0]:.2f}% | "
+-                     f"{values.iloc[1]:.2f}% | {values.iloc[2]:.2f}% |")
+-    lines.extend(["", "宏平均给 10 种条件相同权重；完整的逐条件结果见 `ood_four_policy_summary.csv`。",
+-                  "这些图展示观测结果，不据此宣称算法差异具有统计显著性。", ""])
+-    path = root / "plot_notes.md"
+-    with path.open("x", encoding="utf-8") as stream:
+-        stream.write("\n".join(lines))
+-    print(path)
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--run-dir", type=Path,
+-                        default=Path("runs/ood_pgd_20261012"))
+-    args = parser.parse_args()
+-    root = args.run_dir.resolve()
+-    outputs = [root / f"{stem}.{suffix}"
+-               for stem in ("ood_four_policy_comparison", "training_curves")
+-               for suffix in ("png", "svg")]
+-    outputs += [root / "ood_four_policy_summary.csv", root / "plot_notes.md"]
+-    existing = [path for path in outputs if path.exists()]
+-    if existing:
+-        parser.error("output already exists: " + ", ".join(map(str, existing)))
+-    ood, train, valid, selections = load_data(root)
+-    summary = summarize_ood(ood)
+-    summary.to_csv(root / "ood_four_policy_summary.csv", index=False,
+-                   encoding="utf-8-sig")
+-    ood_overview(root, summary)
+-    training_curves(root, train, valid, selections)
+-    write_notes(root, summary)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/run_mixed_ppo_earlystop_ood.py b/scripts/run_mixed_ppo_earlystop_ood.py
+deleted file mode 100644
+index cdb7585..0000000
+--- a/scripts/run_mixed_ppo_earlystop_ood.py
++++ /dev/null
+@@ -1,474 +0,0 @@
+-"""Train mixed PPO, select on held-out mixed seeds, then run paired OOD tests.
+-
+-Run with the project's Anaconda Python, for example:
+-  D:\\Anaconda_envs\\envs\\migrationproject\\python.exe \
+-    scripts/run_mixed_ppo_earlystop_ood.py --output-dir runs/mixed_v1_new
+-The output directory must be new. Use --phase resume after an interrupted
+-training run, or --phase ood after training completed without OOD evaluation.
+-"""
+-
+-from __future__ import annotations
+-
+-import argparse
+-import csv
+-import json
+-import math
+-import statistics
+-import sys
+-from dataclasses import asdict
+-from pathlib import Path
+-from xml.sax.saxutils import escape
+-
+-# A file launched from scripts/ must still import the local ftm checkout.
+-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+-
+-from ftm.config import MonitoringConfig, SimulationConfig
+-from ftm.environment import MigrationEnvironment, scenario_by_name
+-from ftm.experiment_suite import (_episode_row, bootstrap_interval,
+-                                  build_evaluation_cases)
+-from ftm.main import run_episode
+-from ftm.observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION
+-from ftm.robust_ppo import (FiniteScenarioRobustPPO, PPOConfig,
+-                            _build_actor_critic)
+-from ftm.trained_policy import TrainedPolicy, run_trained_episode
+-
+-
+-BASELINES = ("no_migration", "random", "time_min", "resource_min",
+-             "time_resource_min")
+-METRICS = ("task_completion_rate", "task_service_availability",
+-           "sla_violation_rate", "migration_count", "total_reward")
+-
+-
+-def _write_csv(path: Path, rows: list[dict]) -> None:
+-    if not rows:
+-        raise ValueError(f"no records for {path}")
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    with path.open("x", newline="", encoding="utf-8") as stream:
+-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+-        writer.writeheader()
+-        writer.writerows(rows)
+-
+-
+-def _read_csv(path: Path) -> list[dict]:
+-    with path.open(newline="", encoding="utf-8-sig") as stream:
+-        return list(csv.DictReader(stream))
+-
+-
+-def _write_json(path: Path, value: dict) -> None:
+-    with path.open("x", encoding="utf-8") as stream:
+-        json.dump(value, stream, ensure_ascii=False, indent=2)
+-
+-
+-def _all_training_rows(root: Path) -> list[dict]:
+-    rows = []
+-    for path in sorted((root / "training").glob("episodes_*.csv")):
+-        rows.extend(_read_csv(path))
+-    return rows
+-
+-
+-def _all_validation_rows(root: Path) -> list[dict]:
+-    rows = []
+-    for path in sorted((root / "validation").glob("checkpoint_*.csv")):
+-        rows.extend(_read_csv(path))
+-    return rows
+-
+-
+-def _plot_curve(path: Path, training: list[dict], validation: list[dict],
+-                selected_episode: int | None, max_episodes: int) -> None:
+-    """Standalone SVG, so the experiment needs no plotting dependency."""
+-    train = [(int(row["episode"]), float(row["discounted_return"]))
+-             for row in training]
+-    valid = [(int(row["episode"]), float(row["mean_discounted_return"]))
+-             for row in validation]
+-    if not train:
+-        return
+-    width, height = 1080, 600
+-    left, right, top, bottom = 80, 30, 65, 75
+-    plot_w, plot_h = width - left - right, height - top - bottom
+-    all_y = [value for _, value in train + valid]
+-    low, high = min(all_y), max(all_y)
+-    pad = max(1.0, (high - low) * 0.08)
+-    low, high = low - pad, high + pad
+-
+-    def x_pos(x: int) -> float:
+-        return left + plot_w * x / max_episodes
+-
+-    def y_pos(y: float) -> float:
+-        return top + plot_h * (high - y) / (high - low)
+-
+-    def polyline(points: list[tuple[int, float]], color: str,
+-                 stroke_width: int) -> str:
+-        coords = " ".join(f"{x_pos(x):.1f},{y_pos(y):.1f}" for x, y in points)
+-        return (f'<polyline fill="none" stroke="{color}" '
+-                f'stroke-width="{stroke_width}" points="{coords}"/>')
+-
+-    rolling = []
+-    for index, (episode, _) in enumerate(train):
+-        rolling.append((episode, statistics.mean(
+-            value for _, value in train[max(0, index - 99):index + 1])))
+-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" '
+-             f'width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+-             '<rect width="100%" height="100%" fill="white"/>',
+-             f'<text x="{left}" y="35" font-size="22" fill="#172033">'
+-             f'{escape("Mixed PPO training and held-out validation")}</text>']
+-    for index in range(6):
+-        value = low + (high - low) * index / 5
+-        y = y_pos(value)
+-        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" '
+-                     f'y2="{y:.1f}" stroke="#e5eaf0"/>')
+-        parts.append(f'<text x="{left-9}" y="{y+4:.1f}" text-anchor="end" '
+-                     f'font-size="12" fill="#4b5563">{value:.2f}</text>')
+-    for episode in range(0, max_episodes + 1,
+-                         max(1, math.ceil(max_episodes / 5))):
+-        x = x_pos(episode)
+-        parts.append(f'<text x="{x:.1f}" y="{height-bottom+25}" '
+-                     f'text-anchor="middle" font-size="12" fill="#4b5563">'
+-                     f'{episode}</text>')
+-    parts.extend((polyline(train, "#ccd5df", 1),
+-                  polyline(rolling, "#2563eb", 2),
+-                  polyline(valid, "#ea580c", 3)))
+-    for episode, value in valid:
+-        fill = "#16a34a" if episode == selected_episode else "#ea580c"
+-        parts.append(f'<circle cx="{x_pos(episode):.1f}" '
+-                     f'cy="{y_pos(value):.1f}" r="5" fill="{fill}"/>')
+-    parts.append(f'<text x="{width/2}" y="{height-20}" '
+-                 'text-anchor="middle" font-size="14">Training episode</text>')
+-    parts.append(f'<text x="{left}" y="{height-47}" font-size="13" '
+-                 'fill="#2563eb">Train: rolling 100 episodes</text>')
+-    parts.append(f'<text x="{left+265}" y="{height-47}" font-size="13" '
+-                 'fill="#ea580c">Validation: fixed held-out seeds</text>')
+-    parts.append(f'<text x="{left+585}" y="{height-47}" font-size="13" '
+-                 'fill="#16a34a">Selected checkpoint</text>')
+-    parts.append('</svg>')
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    with path.open("x", encoding="utf-8") as stream:
+-        stream.write("\n".join(parts))
+-
+-
+-def _init_trainer(config: SimulationConfig, ppo_config: PPOConfig,
+-                  device: str, seed: int) -> FiniteScenarioRobustPPO:
+-    import torch
+-
+-    torch.manual_seed(seed)
+-    if device == "cuda":
+-        torch.cuda.manual_seed_all(seed)
+-    torch.backends.cudnn.benchmark = False
+-    torch.backends.cudnn.deterministic = True
+-    trainer = FiniteScenarioRobustPPO(config, ppo_config, ("mixed",), device, seed)
+-    probe = MigrationEnvironment(config, scenario_by_name("mixed", config))
+-    state, _ = probe.reset(seed)
+-    trainer.model = _build_actor_critic(len(state), config.n_nodes + 1).to(device)
+-    trainer.optimizer = torch.optim.Adam(trainer.model.parameters(),
+-                                         lr=ppo_config.learning_rate)
+-    return trainer
+-
+-
+-def train(root: Path, args: argparse.Namespace, config: SimulationConfig,
+-          ppo_config: PPOConfig, resume: bool = False) -> dict:
+-    import torch
+-
+-    trainer = _init_trainer(config, ppo_config, args.device, args.train_seed)
+-    best_score = float("-inf")
+-    patience_score = float("-inf")
+-    best_episode = None
+-    stale = 0
+-    segment = []
+-    start_episode = 1
+-    if resume:
+-        states = sorted((root / "training_state").glob("state_ep*.pt"))
+-        if not states:
+-            raise ValueError("no complete checkpoint state is available to resume")
+-        state = torch.load(states[-1], map_location="cpu", weights_only=False)
+-        checkpoint_data = torch.load(root / state["checkpoint"],
+-                                     map_location="cpu", weights_only=False)
+-        trainer.model.load_state_dict(checkpoint_data["model_state_dict"])
+-        trainer.optimizer.load_state_dict(state["optimizer_state_dict"])
+-        torch.set_rng_state(state["torch_rng_state"])
+-        if args.device == "cuda":
+-            torch.cuda.set_rng_state_all(state["cuda_rng_states"])
+-        best_score = state["best_score"]
+-        patience_score = state["patience_score"]
+-        best_episode = state["best_episode"]
+-        stale = state["stale"]
+-        start_episode = state["episode"] + 1
+-        print(f"TRAINING_RESUMED after_episode={state['episode']}", flush=True)
+-    completed_episode = start_episode - 1
+-    for episode in range(start_episode, args.episodes + 1):
+-        result, rollout = trainer._collect_episode(
+-            "mixed", args.train_seed + episode - 1, episode)
+-        trainer._ppo_update(rollout)
+-        segment.append(asdict(result))
+-        completed_episode = episode
+-        if episode % args.interval and episode != args.episodes:
+-            continue
+-        checkpoint = root / "checkpoints" / f"mixed_ppo_ep{episode:05d}.pt"
+-        trainer.save(checkpoint, episode)
+-        _write_csv(root / "training" / f"episodes_{episode:05d}.csv", segment)
+-        segment = []
+-        trainer.model.eval()
+-        try:
+-            scores = [trainer._evaluate_episode("mixed", args.validation_seed + i)
+-                      for i in range(args.validation_episodes)]
+-        finally:
+-            trainer.model.train()
+-        mean_score = statistics.mean(scores)
+-        improved = best_episode is None or mean_score > best_score
+-        if improved:
+-            best_score, best_episode = mean_score, episode
+-        meaningful_improvement = (patience_score == float("-inf")
+-                                  or mean_score > patience_score + args.min_delta)
+-        if meaningful_improvement:
+-            patience_score, stale = mean_score, 0
+-        else:
+-            stale += 1
+-        row = {"episode": episode, "mean_discounted_return": mean_score,
+-               "std_discounted_return": statistics.stdev(scores)
+-               if len(scores) > 1 else 0.0,
+-               "validation_episodes": len(scores), "improved": improved,
+-               "meaningful_improvement": meaningful_improvement,
+-               "consecutive_nonimprovements": stale,
+-               "checkpoint": str(checkpoint.relative_to(root))}
+-        _write_csv(root / "validation" / f"checkpoint_{episode:05d}.csv", [row])
+-        state_path = root / "training_state" / f"state_ep{episode:05d}.pt"
+-        state_path.parent.mkdir(parents=True, exist_ok=True)
+-        with state_path.open("xb") as stream:
+-            torch.save({
+-                "episode": episode,
+-                "checkpoint": str(checkpoint.relative_to(root)),
+-                "optimizer_state_dict": trainer.optimizer.state_dict(),
+-                "torch_rng_state": torch.get_rng_state(),
+-                "cuda_rng_states": torch.cuda.get_rng_state_all()
+-                if args.device == "cuda" else [],
+-                "best_score": best_score, "patience_score": patience_score,
+-                "best_episode": best_episode, "stale": stale,
+-            }, stream)
+-        _plot_curve(root / "curves" / f"curve_ep{episode:05d}.svg",
+-                    _all_training_rows(root), _all_validation_rows(root),
+-                    best_episode, args.episodes)
+-        print(f"CHECKPOINT_VALIDATED episode={episode} score={mean_score:.6f} "
+-              f"best_episode={best_episode} stale={stale}", flush=True)
+-        if args.patience and stale >= args.patience:
+-            print(f"EARLY_STOP episode={episode}", flush=True)
+-            break
+-    selected = {
+-        "best_episode": best_episode, "best_score": best_score,
+-        "checkpoint": f"checkpoints/mixed_ppo_ep{best_episode:05d}.pt",
+-        "completed_episodes": completed_episode,
+-        "stopped_early": completed_episode < args.episodes,
+-        "selection_metric": "held-out mixed mean discounted return",
+-        "validation_seed_start": args.validation_seed,
+-        "validation_seed_end": args.validation_seed + args.validation_episodes - 1,
+-    }
+-    _write_json(root / "selected_checkpoint.json", selected)
+-    _write_csv(root / "training.csv", _all_training_rows(root))
+-    _write_csv(root / "validation.csv", _all_validation_rows(root))
+-    _plot_curve(root / "training_curve.svg", _all_training_rows(root),
+-                _all_validation_rows(root), best_episode, args.episodes)
+-    with (root / "TRAINING_COMPLETE.txt").open("x", encoding="utf-8") as stream:
+-        stream.write(f"episodes={completed_episode}\nbest_episode={best_episode}\n"
+-                     f"device={args.device}\n")
+-    return selected
+-
+-
+-def _summarize_ood(output_dir: Path, rows: list[dict], resamples: int,
+-                   seed: int) -> None:
+-    groups: dict[tuple[str, str], list[dict]] = {}
+-    for row in rows:
+-        groups.setdefault((row["scenario_id"], row["policy"]), []).append(row)
+-    summaries = []
+-    for (scenario, policy), group in sorted(groups.items()):
+-        for metric in METRICS:
+-            values = [float(row[metric]) for row in group]
+-            low, high = bootstrap_interval(values, seed, resamples)
+-            summaries.append({"scenario_id": scenario, "policy": policy,
+-                              "metric": metric, "n": len(values),
+-                              "mean": statistics.mean(values),
+-                              "ci95_low": low, "ci95_high": high})
+-    _write_csv(output_dir / "summary.csv", summaries)
+-    by_key = {(row["scenario_id"], row["seed"], row["policy"]): row
+-              for row in rows}
+-    paired = []
+-    for scenario in sorted({row["scenario_id"] for row in rows}):
+-        seeds = sorted({row["seed"] for row in rows
+-                        if row["scenario_id"] == scenario})
+-        for baseline in BASELINES:
+-            for metric in METRICS:
+-                differences = [
+-                    float(by_key[(scenario, run_seed, "ordinary_ppo")][metric])
+-                    - float(by_key[(scenario, run_seed, baseline)][metric])
+-                    for run_seed in seeds]
+-                low, high = bootstrap_interval(differences, seed, resamples)
+-                paired.append({"scenario_id": scenario, "baseline": baseline,
+-                               "metric": metric, "n_pairs": len(differences),
+-                               "ppo_minus_baseline": statistics.mean(differences),
+-                               "ci95_low": low, "ci95_high": high})
+-    _write_csv(output_dir / "paired_vs_baselines.csv", paired)
+-    macro = []
+-    for policy in (*BASELINES, "ordinary_ppo"):
+-        for metric in METRICS:
+-            values = [row["mean"] for row in summaries
+-                      if row["policy"] == policy and row["metric"] == metric]
+-            macro.append({"policy": policy, "metric": metric,
+-                          "ood_conditions": len(values),
+-                          "macro_mean": statistics.mean(values)})
+-    _write_csv(output_dir / "macro_summary.csv", macro)
+-
+-
+-def evaluate_ood(root: Path, args: argparse.Namespace,
+-                 config: SimulationConfig, selected: dict) -> None:
+-    output_dir = args.ood_output_dir or root / "ood"
+-    if (output_dir / "episodes.csv").exists():
+-        raise FileExistsError("OOD results already exist; choose a fresh output directory")
+-    cases = build_evaluation_cases("ood", "all", "all", config)
+-    if len(cases) != 10:
+-        raise RuntimeError("expected the existing five OOD families at L1 and L2")
+-    probe = MigrationEnvironment(config, scenario_by_name("mixed", config))
+-    state, _ = probe.reset(args.ood_seed)
+-    controller = TrainedPolicy(root / selected["checkpoint"], len(state),
+-                               config.n_nodes + 1, device=args.device)
+-    rows = []
+-    for case in cases:
+-        for index in range(args.ood_episodes):
+-            run_seed = args.ood_seed + index
+-            for name in (*BASELINES, "ordinary_ppo"):
+-                if name == "ordinary_ppo":
+-                    import torch
+-                    torch.manual_seed(run_seed)
+-                    metrics, _ = run_trained_episode(name, case.scenario,
+-                                                     run_seed, config, controller)
+-                else:
+-                    metrics, _ = run_episode(name, case.scenario, run_seed, config)
+-                rows.append(_episode_row(metrics, case))
+-        print(f"OOD_CONDITION_COMPLETE scenario={case.scenario_id} "
+-              f"paired_seeds={args.ood_episodes}", flush=True)
+-    _write_csv(output_dir / "episodes.csv", rows)
+-    _summarize_ood(output_dir, rows, args.bootstrap_resamples, args.ood_seed)
+-    _write_json(output_dir / "evaluation_config.json", {
+-        "checkpoint": selected["checkpoint"],
+-        "selected_on": selected["selection_metric"],
+-        "ood_seed_start": args.ood_seed,
+-        "ood_seed_end": args.ood_seed + args.ood_episodes - 1,
+-        "episodes_per_condition_per_policy": args.ood_episodes,
+-        "cases": [case.scenario_id for case in cases],
+-        "policies": [*BASELINES, "ordinary_ppo"],
+-        "action_selection": "categorical_sampling",
+-        "device": args.device, "observation_schema_version": SCHEMA_VERSION,
+-    })
+-    with (output_dir / "OOD_COMPLETE.txt").open("x", encoding="utf-8") as stream:
+-        stream.write(f"episodes={len(rows)}\nconditions={len(cases)}\n")
+-
+-
+-def _check_disjoint(args: argparse.Namespace) -> None:
+-    spans = (("train", args.train_seed, args.episodes),
+-             ("validation", args.validation_seed, args.validation_episodes),
+-             ("ood", args.ood_seed, args.ood_episodes))
+-    for index, (name, start, count) in enumerate(spans):
+-        for other, other_start, other_count in spans[index + 1:]:
+-            if max(start, other_start) < min(start + count, other_start + other_count):
+-                raise ValueError(f"{name} and {other} seed ranges overlap")
+-
+-
+-def main() -> None:
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--output-dir", type=Path, required=True)
+-    parser.add_argument("--phase", choices=("all", "train", "resume", "ood"),
+-                        default="all")
+-    parser.add_argument("--episodes", type=int, default=10_000)
+-    parser.add_argument("--interval", type=int, default=1_000)
+-    parser.add_argument("--patience", type=int, default=3,
+-                        help="checkpoint validations without improvement; 0 trains all episodes")
+-    parser.add_argument("--min-delta", type=float, default=0.01)
+-    parser.add_argument("--validation-episodes", type=int, default=100)
+-    parser.add_argument("--ood-episodes", type=int, default=100)
+-    parser.add_argument("--ood-output-dir", type=Path,
+-                        help="destination for OOD results; defaults to <output-dir>/ood")
+-    parser.add_argument("--train-seed", type=int, default=2026)
+-    parser.add_argument("--validation-seed", type=int, default=20_026)
+-    parser.add_argument("--ood-seed", type=int, default=30_026)
+-    parser.add_argument("--bootstrap-resamples", type=int, default=1_000)
+-    parser.add_argument("--max-time", type=float, default=600.0)
+-    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+-    parser.add_argument("--dry-run", action="store_true")
+-    args = parser.parse_args()
+-    if (args.episodes < 1 or args.interval < 1 or args.patience < 0
+-            or args.validation_episodes < 2 or args.ood_episodes < 2
+-            or args.bootstrap_resamples < 100 or args.min_delta < 0
+-            or args.max_time <= 0):
+-        parser.error("invalid episode, interval, patience, resample or min-delta value")
+-    try:
+-        _check_disjoint(args)
+-    except ValueError as exc:
+-        parser.error(str(exc))
+-    import torch
+-
+-    if args.device == "cuda" and not torch.cuda.is_available():
+-        parser.error("CUDA was requested but PyTorch cannot access a GPU")
+-    root = args.output_dir.resolve()
+-    if args.phase in ("all", "train") and root.exists():
+-        parser.error("output directory already exists; choose a new one")
+-    if args.phase == "resume" and ((root / "TRAINING_COMPLETE.txt").exists()
+-                                   or not (root / "training_state").is_dir()):
+-        parser.error("resume requires an interrupted run with checkpoint state")
+-    if args.phase == "ood" and not (root / "TRAINING_COMPLETE.txt").is_file():
+-        parser.error("OOD phase requires a completed training run")
+-    config = SimulationConfig(max_time_seconds=args.max_time)
+-    ppo_config = PPOConfig(gamma=0.995, entropy_coefficient=0.03,
+-                           learning_rate=3e-4, clip_ratio=0.2,
+-                           update_epochs=8, minibatch_size=128,
+-                           gae_lambda=0.95, scenario_eval_interval=args.interval)
+-    if args.dry_run:
+-        print(json.dumps({"output_dir": str(root), "phase": args.phase,
+-                          "training_max_episodes": args.episodes,
+-                          "checkpoint_interval": args.interval,
+-                          "patience": args.patience,
+-                          "validation_episodes_per_checkpoint": args.validation_episodes,
+-                          "ood_cases": 10, "ood_episodes_per_policy_per_case":
+-                          args.ood_episodes, "ood_total_episodes":
+-                          10 * 6 * args.ood_episodes,
+-                          "device": args.device,
+-                          "cuda_device": torch.cuda.get_device_name(0)
+-                          if args.device == "cuda" else None}, indent=2))
+-        return
+-    if args.phase in ("all", "train"):
+-        root.mkdir(parents=True, exist_ok=False)
+-        _write_json(root / "experiment_config.json", {
+-            "arguments": vars(args) | {"output_dir": str(root)},
+-            "env_config": asdict(config), "ppo_config": asdict(ppo_config),
+-            "observation_schema_version": SCHEMA_VERSION,
+-            "feature_order": FEATURE_ORDER, "feature_scales": FEATURE_SCALES,
+-            "ood_design": "five existing OOD families at L1/L2; never used for selection",
+-            "ood_primary_metric": "task_completion_rate",
+-            "ood_secondary_metrics": [metric for metric in METRICS
+-                                      if metric != "task_completion_rate"],
+-            "comparison": "paired seeds within each OOD condition; descriptive bootstrap CI",
+-        })
+-        selected = train(root, args, config, ppo_config)
+-    else:
+-        saved = json.loads((root / "experiment_config.json").read_text(
+-            encoding="utf-8"))
+-        saved_args = saved["arguments"]
+-        _check_disjoint(argparse.Namespace(
+-            train_seed=saved_args["train_seed"], episodes=saved_args["episodes"],
+-            validation_seed=saved_args["validation_seed"],
+-            validation_episodes=saved_args["validation_episodes"],
+-            ood_seed=args.ood_seed, ood_episodes=args.ood_episodes))
+-        config_data = dict(saved["env_config"])
+-        config_data["monitoring"] = MonitoringConfig(**config_data["monitoring"])
+-        config = SimulationConfig(**config_data)
+-        if saved["observation_schema_version"] != SCHEMA_VERSION:
+-            raise ValueError("saved run observation schema does not match current code")
+-        if args.phase == "resume":
+-            resumed_args = argparse.Namespace(**saved_args)
+-            ppo_config = PPOConfig(**saved["ppo_config"])
+-            _check_disjoint(resumed_args)
+-            selected = train(root, resumed_args, config, ppo_config, resume=True)
+-            args = resumed_args
+-        else:
+-            selected = json.loads((root / "selected_checkpoint.json").read_text(
+-                encoding="utf-8"))
+-    if args.phase in ("all", "ood"):
+-        evaluate_ood(root, args, config, selected)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/start_ood_pgd_six.ps1 b/scripts/start_ood_pgd_six.ps1
+deleted file mode 100644
+index 9815bf1..0000000
+--- a/scripts/start_ood_pgd_six.ps1
++++ /dev/null
+@@ -1,99 +0,0 @@
+-param(
+-    [string]$Python = 'D:\Anaconda_envs\envs\migrationproject\python.exe',
+-    [string]$RunName = 'ood_pgd_20261012',
+-    [int]$PilotPid = 43484
+-)
+-
+-$ErrorActionPreference = 'Stop'
+-$repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+-$entry = Join-Path $PSScriptRoot 'run_ood_pgd_parallel_worker.py'
+-$root = Join-Path $repo (Join-Path 'runs' $RunName)
+-$log = Join-Path $root 'six_parallel_queue.log'
+-$pilotMarker = Join-Path $root 'pilot_seed1\TRAINING_COMPLETE.txt'
+-
+-function Start-Worker([int]$Seed, [string]$Phase, [string]$Method) {
+-    $label = if ($Method) { "seed${Seed}_${Method}" } else { "seed${Seed}_${Phase}" }
+-    $output = Join-Path $root "main_seed$Seed"
+-    if ($Phase -eq 'prepare' -and (Test-Path -LiteralPath $output)) {
+-        throw "Output already exists: $output"
+-    }
+-    $stdout = Join-Path $root "$label.stdout.log"
+-    $stderr = Join-Path $root "$label.stderr.log"
+-    $arguments = @('-u', $entry, '--output-dir', $output, '--phase', $Phase,
+-                   '--seed', "$Seed", '--episodes', '20000',
+-                   '--warmup', '2000', '--device', 'cuda')
+-    if ($Method) { $arguments += @('--method', $Method) }
+-    $process = Start-Process -FilePath $Python -ArgumentList $arguments `
+-        -WorkingDirectory $repo -PassThru -WindowStyle Hidden `
+-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+-    "START label=$label pid=$($process.Id) $(Get-Date -Format o)" |
+-        Add-Content -LiteralPath $log
+-    $marker = switch ($Phase) {
+-        'prepare' { Join-Path $output 'PREPARE_COMPLETE.txt' }
+-        'branch' { Join-Path (Join-Path $output $Method) 'BRANCH_COMPLETE.txt' }
+-        'test' { Join-Path $output 'TEST_COMPLETE.txt' }
+-    }
+-    return [pscustomobject]@{ Label=$label; Process=$process; Marker=$marker;
+-                              Stderr=$stderr }
+-}
+-
+-function Wait-Stage([object[]]$Jobs) {
+-    $pending = @($Jobs)
+-    try {
+-        while ($pending.Count -gt 0) {
+-            foreach ($job in @($pending)) {
+-                $job.Process.Refresh()
+-                if (-not $job.Process.HasExited) { continue }
+-                if (-not (Test-Path -LiteralPath $job.Marker)) {
+-                    "FAILED label=$($job.Label) launcher_exit=$($job.Process.ExitCode) missing_final_marker" |
+-                        Add-Content -LiteralPath $log
+-                    throw "Worker failed: $($job.Label). See $($job.Stderr)"
+-                }
+-                if ($job.Process.ExitCode -ne 0) {
+-                    "WARNING label=$($job.Label) launcher_exit=$($job.Process.ExitCode) final_marker_present" |
+-                        Add-Content -LiteralPath $log
+-                }
+-                "COMPLETE label=$($job.Label) $(Get-Date -Format o)" |
+-                    Add-Content -LiteralPath $log
+-                $pending = @($pending | Where-Object { $_.Label -ne $job.Label })
+-            }
+-            if ($pending.Count -gt 0) { Start-Sleep -Seconds 30 }
+-        }
+-    } catch {
+-        foreach ($job in $pending) {
+-            $job.Process.Refresh()
+-            if (-not $job.Process.HasExited) {
+-                Stop-Process -Id $job.Process.Id -ErrorAction SilentlyContinue
+-                "STOPPED label=$($job.Label) due_to_stage_failure" |
+-                    Add-Content -LiteralPath $log
+-            }
+-        }
+-        throw
+-    }
+-}
+-
+-try {
+-    "WAIT_PILOT pid=$PilotPid $(Get-Date -Format o)" | Add-Content -LiteralPath $log
+-    while (-not (Test-Path -LiteralPath $pilotMarker)) {
+-        if (-not (Get-Process -Id $PilotPid -ErrorAction SilentlyContinue)) {
+-            throw 'Pilot ended without TRAINING_COMPLETE.txt'
+-        }
+-        Start-Sleep -Seconds 30
+-    }
+-    'PILOT_COMPLETE' | Add-Content -LiteralPath $log
+-    $preparations = @(foreach ($seed in 1..3) { Start-Worker $seed 'prepare' '' })
+-    Wait-Stage $preparations
+-    'SIX_BRANCHES_STARTING' | Add-Content -LiteralPath $log
+-    $branches = @(foreach ($seed in 1..3) {
+-        foreach ($method in @('ppo', 'pgd_ppo')) {
+-            Start-Worker $seed 'branch' $method
+-        }
+-    })
+-    Wait-Stage $branches
+-    $tests = @(foreach ($seed in 1..3) { Start-Worker $seed 'test' '' })
+-    Wait-Stage $tests
+-    'QUEUE_COMPLETE' | Add-Content -LiteralPath $log
+-} catch {
+-    "QUEUE_STOPPED $($_.Exception.Message)" | Add-Content -LiteralPath $log
+-    throw
+-}
+diff --git a/tests/test_research_logic_updates.py b/tests/test_research_logic_updates.py
+index 27cf76b..9e08317 100644
+--- a/tests/test_research_logic_updates.py
++++ b/tests/test_research_logic_updates.py
+@@ -183,6 +183,35 @@ class ResearchLogicUpdateTests(unittest.TestCase):
+         horizon = MigrationEnvironment._event_reward(Event(1.0, "horizon_incomplete", 0))
+         self.assertEqual(task_failure, horizon)
+         self.assertEqual(task_failure, -1.0)
++        self.assertEqual(MigrationEnvironment._event_reward(
++            Event(1.0, "sla_violated", 0)), 0.0)
++
++    def test_time_cost_uses_task_deadline_and_overdue_duration(self):
++        config = SimulationConfig(
++            n_nodes=2, n_tasks=1, k_required=1, max_time_seconds=3.0,
++            base_failure_rate=0.0, base_repair_rate=0.0,
++            task_work_min=100.0, task_work_max=100.0,
++            progress_reward_weight=0.0, service_loss_cost_weight=0.0,
++        )
++        quiet = ScenarioConfig(name="quiet", failure_multiplier=0.0,
++                               congestion_enter=0.0, load_burst_probability=0.0)
++        env = MigrationEnvironment(config, quiet)
++        env.reset(seed=41)
++        task = next(iter(env.cluster.tasks.values()))
++        task.deadline_seconds = 0.5
++
++        _, first_reward, _, _, first_info = env.step(config.n_nodes)
++        _, second_reward, _, _, _ = env.step(config.n_nodes)
++        self.assertAlmostEqual(first_reward, -1.5)
++        self.assertAlmostEqual(second_reward, -2.0)
++        self.assertTrue(any(event["kind"] == "sla_violated"
++                            for event in first_info["events"]))
++
++        later_env = MigrationEnvironment(config, quiet)
++        later_env.reset(seed=41)
++        next(iter(later_env.cluster.tasks.values())).deadline_seconds = 2.0
++        _, later_reward, _, _, _ = later_env.step(config.n_nodes)
++        self.assertAlmostEqual(later_reward, -0.25)
+ 
+     def test_reward_includes_dense_service_loss_and_progress(self):
+         interrupted_config = SimulationConfig(
+@@ -199,7 +228,8 @@ class ResearchLogicUpdateTests(unittest.TestCase):
+         interrupted_env.cluster.nodes[task.node_id].up = False
+         task.status = TaskStatus.INTERRUPTED
+         _, reward, _, _, _ = interrupted_env.step(interrupted_config.n_nodes)
+-        self.assertAlmostEqual(reward, -0.15)
++        self.assertAlmostEqual(
++            reward, -0.1 - interrupted_config.delay_cost_weight / task.deadline_seconds)
+         task.status = TaskStatus.MIGRATING
+         self.assertEqual(interrupted_env._service_loss_ratio(), 0.0)
+ 

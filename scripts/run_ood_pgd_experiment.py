@@ -25,11 +25,13 @@ from ftm.experiment_suite import (_episode_row, bootstrap_interval,
                                   build_evaluation_cases)
 from ftm.main import run_episode
 from ftm.observation import FEATURE_ORDER, FEATURE_SCALES, SCHEMA_VERSION
-from ftm.robust_ppo import FiniteScenarioRobustPPO, PPOConfig, _build_actor_critic
+from ftm.hierarchical_ppo import HierarchicalPPO, build_hierarchical_actor_critic
+from ftm.robust_ppo import PPOConfig
 from ftm.surrogate import (fit_surrogate, raw_to_scenario, scenario_to_raw,
                            training_raw_bounds, worst_case_scenario)
 from ftm.surrogate_dataset import collect as collect_surrogate_data
 from ftm.trained_policy import TrainedPolicy, run_trained_episode
+from run_ppo_abc import pretrain_gate
 
 SCENARIOS = ("normal", "failure", "network", "load", "mixed")
 POLICIES = ("no_migration", "time_min", "ppo", "pgd_ppo")
@@ -57,19 +59,24 @@ def balanced_schedule(count: int, seed: int) -> list[str]:
 
 
 def make_trainer(config: SimulationConfig, ppo: PPOConfig, seed: int,
-                 device: str) -> FiniteScenarioRobustPPO:
+                 device: str) -> HierarchicalPPO:
     import torch
 
     torch.manual_seed(seed)
-    trainer = FiniteScenarioRobustPPO(config, ppo, SCENARIOS, device, seed)
+    trainer = HierarchicalPPO(config, ppo, SCENARIOS, device, seed, auxiliary=True)
     probe = MigrationEnvironment(config, scenario_by_name("normal", config))
     state, _ = probe.reset(seed)
-    trainer.model = _build_actor_critic(len(state), config.n_nodes + 1).to(device)
+    trainer.model = build_hierarchical_actor_critic(
+        len(state), config.n_nodes + 1).to(device)
     trainer.optimizer = torch.optim.Adam(trainer.model.parameters(), lr=ppo.learning_rate)
     return trainer
 
 
-def save_checkpoint(trainer: FiniteScenarioRobustPPO, path: Path, episode: int,
+def set_auxiliary_beta(trainer: HierarchicalPPO, episode: int, args) -> None:
+    trainer.auxiliary_beta = args.aux_beta * max(0.0, 1 - episode / args.episodes)
+
+
+def save_checkpoint(trainer: HierarchicalPPO, path: Path, episode: int,
                     extra: dict) -> None:
     import torch
 
@@ -78,8 +85,9 @@ def save_checkpoint(trainer: FiniteScenarioRobustPPO, path: Path, episode: int,
         "model_state_dict": trainer.model.state_dict(),
         "observation_schema_version": SCHEMA_VERSION,
         "feature_order": FEATURE_ORDER, "feature_scales": FEATURE_SCALES,
-        "state_dim": trainer.model.body[0].in_features,
-        "action_dim": trainer.model.actor.out_features,
+        "state_dim": trainer.model.gate[0].in_features,
+        "action_dim": trainer.env_config.n_nodes + 1,
+        "model_type": "c_hierarchical_aux",
         "env_config": asdict(trainer.env_config),
         "ppo_config": asdict(trainer.ppo_config),
         "scenario_names": trainer.scenario_names,
@@ -92,7 +100,7 @@ def save_checkpoint(trainer: FiniteScenarioRobustPPO, path: Path, episode: int,
         torch.save(data, stream)
 
 
-def collect_and_update(trainer: FiniteScenarioRobustPPO, scenario: str,
+def collect_and_update(trainer: HierarchicalPPO, scenario: str,
                        env_seed: int, episode: int, buffer: list[dict],
                        rollout_steps: int, override=None):
     result, rollout = trainer._collect_episode(scenario, env_seed, episode, override)
@@ -103,13 +111,13 @@ def collect_and_update(trainer: FiniteScenarioRobustPPO, scenario: str,
     return result
 
 
-def flush(trainer: FiniteScenarioRobustPPO, buffer: list[dict]) -> None:
+def flush(trainer: HierarchicalPPO, buffer: list[dict]) -> None:
     if buffer:
         trainer._ppo_update_many(buffer)
         buffer.clear()
 
 
-def validate(trainer: FiniteScenarioRobustPPO, config: SimulationConfig,
+def validate(trainer: HierarchicalPPO, config: SimulationConfig,
              seeds: list[int]) -> tuple[float, list[dict]]:
     from ftm.metrics import compute_episode_metrics
     import torch
@@ -129,7 +137,7 @@ def validate(trainer: FiniteScenarioRobustPPO, config: SimulationConfig,
                     mask = torch.tensor(context.action_mask, dtype=torch.bool,
                                         device=trainer.device).unsqueeze(0)
                     with torch.no_grad():
-                        logits, _ = trainer.model(state)
+                        logits, _ = trainer.model(state, mask)
                         action = int(logits.masked_fill(~mask, -1e9).argmax(-1).item())
                     _, reward, terminated, truncated, _ = env.step(action)
                     total_reward += reward
@@ -223,8 +231,12 @@ def train(root: Path, config: SimulationConfig, args) -> None:
         {"episode": i + 1, "scenario": scenario, "env_seed": env_seeds[i]}
         for i, scenario in enumerate(schedule)])
     trainer = make_trainer(config, ppo, args.seed * 1_000_000 + 1, args.device)
+    pretrain_info = pretrain_gate(trainer, config, args.seed, args.pretrain_episodes)
+    (root / "gate_pretraining.json").write_text(
+        json.dumps(pretrain_info, indent=2), encoding="utf-8")
     buffer, train_rows, val_rows = [], [], []
     for i in range(args.warmup):
+        set_auxiliary_beta(trainer, i + 1, args)
         result = collect_and_update(trainer, schedule[i], env_seeds[i], i + 1,
                                     buffer, args.rollout_steps)
         train_rows.append(asdict(result) | {"method": "warmup", "adversarial": False})
@@ -235,7 +247,7 @@ def train(root: Path, config: SimulationConfig, args) -> None:
     warmup_score, warmup_validation = validate(trainer, config, val_seeds)
     write_csv(root / "validation" / "warmup.csv", warmup_validation)
     surrogate, records = build_surrogate(root, config, args,
-                                         trainer.model.body[0].in_features)
+                                         trainer.model.gate[0].in_features)
     state = copy.deepcopy(trainer.model.state_dict())
     optim_state = copy.deepcopy(trainer.optimizer.state_dict())
     for method in ("ppo", "pgd_ppo"):
@@ -246,6 +258,7 @@ def train(root: Path, config: SimulationConfig, args) -> None:
         best = warmup_path
         block_choices = None
         for i in range(args.warmup, args.episodes):
+            set_auxiliary_beta(branch, i + 1, args)
             block = (i - args.warmup) // args.block_size
             if method == "pgd_ppo" and (i - args.warmup) % args.block_size == 0:
                 block_choices, pgd_rows = search_block(branch, surrogate, records,
@@ -386,6 +399,8 @@ def main() -> None:
     parser.add_argument("--id-episodes", type=int, default=50)
     parser.add_argument("--ood-episodes", type=int, default=100)
     parser.add_argument("--surrogate-episodes", type=int, default=10)
+    parser.add_argument("--pretrain-episodes", type=int, default=50)
+    parser.add_argument("--aux-beta", type=float, default=0.1)
     parser.add_argument("--surrogate-epochs", type=int, default=20)
     parser.add_argument("--pgd-steps", type=int, default=4)
     parser.add_argument("--pgd-rate", type=float, default=0.05)
@@ -399,8 +414,11 @@ def main() -> None:
             or args.block_size % 5 or args.validation_interval < 1
             or min(args.rollout_steps, args.validation_per_scenario,
                    args.id_episodes, args.ood_episodes, args.surrogate_episodes,
+                   args.pretrain_episodes,
                    args.surrogate_epochs, args.pgd_steps, args.pgd_restarts) < 1):
         parser.error("invalid episode counts or schedule")
+    if args.aux_beta < 0:
+        parser.error("--aux-beta must be non-negative")
     import torch
 
     if args.device == "cuda" and not torch.cuda.is_available():

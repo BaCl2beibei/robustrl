@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import random
+import math
 from collections.abc import Callable
 from typing import Protocol
 
 from .observation import DecisionContext, TaskObservation
+from .reliability import transition_probabilities
 
 
 # Fixed from the project's default training horizon; keep it unchanged for OOD.
@@ -55,6 +57,45 @@ def _predicted_execution_time(context: DecisionContext, task: TaskObservation,
     )
 
 
+def estimate_execution_time(context: DecisionContext, task: TaskObservation,
+                            node_id: int, migration_seconds: float = 0.0) -> float:
+    """Estimate remaining execution time from the shared public observation."""
+    return _predicted_execution_time(context, task, node_id, migration_seconds)
+
+
+def estimate_wait_time(context: DecisionContext, task: TaskObservation) -> float:
+    """Expected time to finish on the source, including interrupted recovery.
+
+    A down node repairs at its observed rate. The simulator then starts a
+    restore delay before execution resumes. A zero repair rate means waiting
+    cannot complete; an already repaired task may still be restoring.
+    """
+    if task.node_id is None or not 0 <= task.node_id < len(context.nodes):
+        return math.inf
+    dt = context.public_config.dt_seconds
+    restore = context.public_config.restore_delay_seconds
+    restore_ticks = math.ceil(restore / dt)
+    source = context.nodes[task.node_id]
+    if task.status == "running":
+        if not source.online:
+            return math.inf
+        recovery = 0.0
+    elif task.status == "interrupted":
+        if source.online:
+            # The public snapshot does not expose the current restore timer.
+            recovery = restore_ticks * dt
+        else:
+            repair_probability = transition_probabilities(
+                max(0.0, source.failure_rate_estimate),
+                max(0.0, source.repair_rate_estimate), dt)[1]
+            if repair_probability <= 0.0:
+                return math.inf
+            recovery = dt / repair_probability + restore_ticks * dt
+    else:
+        return math.inf
+    return recovery + _predicted_execution_time(context, task, task.node_id, recovery)
+
+
 def estimate_migration_time(context: DecisionContext, task: TaskObservation,
                             target_id: int) -> float:
     """Estimate checkpoint transfer, network, and restore time from public data."""
@@ -65,9 +106,12 @@ def estimate_migration_time(context: DecisionContext, task: TaskObservation,
         link = context.link(task.node_id, target_id)
         transfer_seconds = (link.rtt_seconds + task.checkpoint_size_bytes
                             / max(1e-9, link.effective_bandwidth))
-    return (transfer_seconds
-            + context.public_config.checkpoint_fixed_delay_seconds
-            + context.public_config.restore_delay_seconds)
+    dt = context.public_config.dt_seconds
+    transfer_ticks = max(1, math.ceil(
+        (transfer_seconds + context.public_config.checkpoint_fixed_delay_seconds) / dt))
+    # MigrationManager enters RESTORING after transfer and confirms on a later tick.
+    restore_ticks = max(1, math.ceil(context.public_config.restore_delay_seconds / dt))
+    return (transfer_ticks + restore_ticks) * dt
 
 
 def estimate_completion_time(context: DecisionContext, task: TaskObservation,
