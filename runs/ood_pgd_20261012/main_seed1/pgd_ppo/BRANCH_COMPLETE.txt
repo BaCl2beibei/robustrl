@@ -1,3 +1,0 @@
-seed=1
-method=pgd_ppo
-episodes=20000

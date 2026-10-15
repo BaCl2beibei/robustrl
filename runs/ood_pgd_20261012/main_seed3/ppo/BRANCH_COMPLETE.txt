@@ -1,3 +1,0 @@
-seed=3
-method=ppo
-episodes=20000

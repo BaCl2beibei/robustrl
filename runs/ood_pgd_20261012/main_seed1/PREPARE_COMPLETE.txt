@@ -1,3 +1,0 @@
-seed=1
-episodes=2000
-surrogate_records=6326

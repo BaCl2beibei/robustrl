@@ -1,2 +1,0 @@
-episodes=20000
-seed=2

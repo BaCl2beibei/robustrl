@@ -1,5 +1,0 @@
-{
-  "checkpoint": "ppo\\episode_16000.pt",
-  "score": 0.947692350686679,
-  "selection": "fixed independent ID seeds; completion + availability + (1-SLA)"
-}
